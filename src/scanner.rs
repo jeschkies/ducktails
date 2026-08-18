@@ -51,6 +51,11 @@ impl<'a> Scanner<'a> {
     }
 
     pub fn next_token(&mut self) -> Result<Token, ParseError> {
+        // TODO(human): skip trivia before reading the next token.
+        // LogQL allows whitespace between tokens (`{ app = "foo" }`), so `advance()`
+        // currently hands ' ' straight to the match, which falls through to
+        // `UnexpectedToken(' ')`. See the `skips_whitespace_between_tokens` test.
+        self.skip_trivia();
         match self.advance().ok_or(ParseError::UnexpectedEOL)? {
             '{' => Ok(Token::OpenBrace),
             '}' => Ok(Token::CloseBrace),
@@ -73,6 +78,10 @@ impl<'a> Scanner<'a> {
 
             other => Err(ParseError::UnexpectedToken(other)),
         }
+    }
+
+    fn skip_trivia(&mut self) {
+        self.source = self.source.trim_start();
     }
 
     pub fn advance(&mut self) -> Option<char> {
