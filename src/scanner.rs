@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use crate::error::ParseError;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -15,46 +15,22 @@ pub enum Token {
     PipeMatch,
     PipePattern,
     Pipe,
-    Unwrap,
     OpenParenthesis,
     CloseParenthesis,
-}
 
-#[derive(Debug)]
-pub enum ParseError {
-    UnexpectedToken(char),
-    UnexpectedEOL,
+    String(String),
 }
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            &ParseError::UnexpectedToken(t) => write!(f, "Unexpected Token: {t}"),
-            &ParseError::UnexpectedEOL => write!(f, "Unexpected end of line"),
-        }
-    }
-}
-
-impl Error for ParseError {}
 
 pub struct Scanner<'a> {
     source: &'a str,
-    tokens: Vec<Token>,
 }
 
 impl<'a> Scanner<'a> {
     pub fn new(query: &'a str) -> Self {
-        Scanner {
-            source: query,
-            tokens: Vec::new(),
-        }
+        Scanner { source: query }
     }
 
     pub fn next_token(&mut self) -> Result<Token, ParseError> {
-        // TODO(human): skip trivia before reading the next token.
-        // LogQL allows whitespace between tokens (`{ app = "foo" }`), so `advance()`
-        // currently hands ' ' straight to the match, which falls through to
-        // `UnexpectedToken(' ')`. See the `skips_whitespace_between_tokens` test.
         self.skip_trivia();
         match self.advance().ok_or(ParseError::UnexpectedEOL)? {
             '{' => Ok(Token::OpenBrace),
@@ -75,6 +51,8 @@ impl<'a> Scanner<'a> {
             '|' if self.eat('~') => Ok(Token::PipeMatch),
             '|' if self.eat('>') => Ok(Token::PipePattern),
             '|' => Ok(Token::Pipe),
+
+            c if c.is_alphabetic() => self.string(),
 
             other => Err(ParseError::UnexpectedToken(other)),
         }
@@ -102,6 +80,10 @@ impl<'a> Scanner<'a> {
         } else {
             false
         }
+    }
+
+    pub fn string(&mut self) -> Result<Token, ParseError> {
+        todo!("implement string token")
     }
 }
 
