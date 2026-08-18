@@ -18,6 +18,7 @@ pub enum Token {
     OpenParenthesis,
     CloseParenthesis,
 
+    Identifier(String),
     String(String),
 }
 
@@ -52,7 +53,8 @@ impl<'a> Scanner<'a> {
             '|' if self.eat('>') => Ok(Token::PipePattern),
             '|' => Ok(Token::Pipe),
 
-            c if c.is_alphabetic() => self.string(),
+            '"' => self.string(),
+            c if c.is_alphabetic() => self.identifier(),
 
             other => Err(ParseError::UnexpectedToken(other)),
         }
@@ -84,6 +86,10 @@ impl<'a> Scanner<'a> {
 
     pub fn string(&mut self) -> Result<Token, ParseError> {
         todo!("implement string token")
+    }
+
+    pub fn identifier(&mut self) -> Result<Token, ParseError> {
+        todo!("implement identifier token")
     }
 }
 
