@@ -51,23 +51,39 @@ impl Parser {
         Ok(Expr::Log(selector))
     }
 
+    fn expect(scanner: &mut Scanner<'_>, expected: Token) -> Result<(), ParseError> {
+        let actual = scanner.next_token()?;
+        if actual != expected {
+            Err(ParseError::UnexpectedToken(actual, expected))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn eat(scanner: &mut Scanner<'_>, expected: Token) -> Result<bool, ParseError> {
+        let actual = scanner.peek_token()?;
+        if actual == expected {
+            // consume
+            scanner.next_token()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Parse `{ name op "value", ... }`.
     fn selector(scanner: &mut Scanner<'_>) -> Result<Selector, ParseError> {
-        let t = scanner.next_token()?;
-        if t != Token::OpenBrace {
-            return Err(ParseError::UnexpectedToken(t, Token::OpenBrace));
-        }
+        Self::expect(scanner, Token::OpenBrace)?;
 
         let mut matchers = Vec::new();
-        while scanner.peek_token()? != Token::CloseBrace {
-            let m = Parser::matcher(scanner)?;
-            matchers.push(m);
-            if scanner.peek_token()? == Token::Comma {
-                scanner.next_token()?;
+        if scanner.peek_token()? != Token::CloseBrace {
+            matchers.push(Self::matcher(scanner)?);
+            while Self::eat(scanner, Token::Comma)? {
+                matchers.push(Self::matcher(scanner)?);
             }
         }
-        // consume CloseBrace
-        scanner.next_token()?;
+
+        Self::expect(scanner, Token::CloseBrace)?;
 
         Ok(Selector { matchers })
     }
