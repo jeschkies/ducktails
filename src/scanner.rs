@@ -22,6 +22,8 @@ pub enum Token {
 
     Identifier(String),
     String(String),
+
+    EOL,
 }
 
 /// Renders a token as it appears in source, so error messages can quote the
@@ -50,6 +52,8 @@ impl fmt::Display for Token {
             // `{:?}` on a str re-adds the quotes and escapes, which is close
             // enough to LogQL's Go-style string syntax.
             Token::String(value) => write!(f, "{value:?}"),
+
+            Token::EOL => write!(f, "EOL"),
         }
     }
 }
@@ -65,7 +69,10 @@ impl<'a> Scanner<'a> {
 
     pub fn next_token(&mut self) -> Result<Token, ParseError> {
         self.skip_trivia();
-        match self.advance().ok_or(ParseError::UnexpectedEOL)? {
+        let Some(next_char) = self.advance() else {
+            return Ok(Token::EOL);
+        };
+        match next_char {
             '{' => Ok(Token::OpenBrace),
             '}' => Ok(Token::CloseBrace),
             ',' => Ok(Token::Comma),

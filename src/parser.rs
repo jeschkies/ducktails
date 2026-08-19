@@ -42,17 +42,22 @@ pub enum Expr {
     // Metric(SampleExpr) — milestone 2, see DESIGN.md §4.
 }
 
-pub struct Parser;
+pub struct Parser<'a> {
+    scanner: Scanner<'a>,
+}
 
-impl Parser {
+impl<'a> Parser<'a> {
     pub fn parse(query: &str) -> Result<Expr, ParseError> {
-        let mut scanner = Scanner::new(query);
-        let selector = Self::selector(&mut scanner)?;
+        let mut p = Parser {
+            scanner: Scanner::new(query),
+        };
+        let selector = p.selector()?;
+        p.expect(Token::EOL)?;
         Ok(Expr::Log(selector))
     }
 
-    fn expect(scanner: &mut Scanner<'_>, expected: Token) -> Result<(), ParseError> {
-        let actual = scanner.next_token()?;
+    fn expect(&mut self, expected: Token) -> Result<(), ParseError> {
+        let actual = self.scanner.next_token()?;
         if actual != expected {
             Err(ParseError::UnexpectedToken(actual, expected))
         } else {
@@ -60,11 +65,11 @@ impl Parser {
         }
     }
 
-    fn eat(scanner: &mut Scanner<'_>, expected: Token) -> Result<bool, ParseError> {
-        let actual = scanner.peek_token()?;
+    fn eat(&mut self, expected: Token) -> Result<bool, ParseError> {
+        let actual = self.scanner.peek_token()?;
         if actual == expected {
             // consume
-            scanner.next_token()?;
+            self.scanner.next_token()?;
             Ok(true)
         } else {
             Ok(false)
@@ -72,33 +77,33 @@ impl Parser {
     }
 
     /// Parse `{ name op "value", ... }`.
-    fn selector(scanner: &mut Scanner<'_>) -> Result<Selector, ParseError> {
-        Self::expect(scanner, Token::OpenBrace)?;
+    fn selector(&mut self) -> Result<Selector, ParseError> {
+        self.expect(Token::OpenBrace)?;
 
         let mut matchers = Vec::new();
-        if scanner.peek_token()? != Token::CloseBrace {
-            matchers.push(Self::matcher(scanner)?);
-            while Self::eat(scanner, Token::Comma)? {
-                matchers.push(Self::matcher(scanner)?);
+        if self.scanner.peek_token()? != Token::CloseBrace {
+            matchers.push(self.matcher()?);
+            while self.eat(Token::Comma)? {
+                matchers.push(self.matcher()?);
             }
         }
 
-        Self::expect(scanner, Token::CloseBrace)?;
+        self.expect(Token::CloseBrace)?;
 
         Ok(Selector { matchers })
     }
 
-    fn matcher(scanner: &mut Scanner<'_>) -> Result<Matcher, ParseError> {
-        match scanner.next_token()? {
+    fn matcher(&mut self) -> Result<Matcher, ParseError> {
+        match self.scanner.next_token()? {
             Token::Identifier(name) => {
-                let op = match scanner.next_token()? {
+                let op = match self.scanner.next_token()? {
                     Token::Eq => MatchOp::Eq,
                     Token::Neq => MatchOp::Neq,
                     Token::Re => MatchOp::Re,
                     Token::Nre => MatchOp::Nre,
                     other => return Err(ParseError::UnexpectedToken(other, Token::Eq)), // TODO: !=, =~, !~
                 };
-                let value = match scanner.next_token()? {
+                let value = match self.scanner.next_token()? {
                     Token::String(v) => v,
                     other => {
                         return Err(ParseError::UnexpectedToken(
