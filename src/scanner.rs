@@ -174,16 +174,15 @@ impl<'a> Scanner<'a> {
 mod tests {
     use super::*;
 
-    /// Scan until the input is exhausted. Treats `UnexpectedEOL` as the terminator
-    /// and propagates any other error.
+    /// Scan until the input is exhausted. `Token::EOL` terminates the stream and
+    /// is not included in the output; any error propagates.
     fn scan_all(input: &str) -> Result<Vec<Token>, ParseError> {
         let mut scanner = Scanner::new(input);
         let mut out = Vec::new();
         loop {
-            match scanner.next_token() {
-                Ok(token) => out.push(token),
-                Err(ParseError::UnexpectedEOL) => return Ok(out),
-                Err(other) => return Err(other),
+            match scanner.next_token()? {
+                Token::EOL => return Ok(out),
+                token => out.push(token),
             }
         }
     }
@@ -248,8 +247,9 @@ mod tests {
 
     #[test]
     fn empty_input_signals_end() {
+        // End of input is a token, not an error, so the parser can `expect` it.
         let got = Scanner::new("").next_token();
-        assert!(matches!(got, Err(ParseError::UnexpectedEOL)), "got {got:?}");
+        assert!(matches!(got, Ok(Token::EOL)), "got {got:?}");
     }
 
     #[test]

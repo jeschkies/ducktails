@@ -129,6 +129,9 @@ mod tests {
     #[test]
     fn parser_selector() {
         let cases = [
+            // The grammar admits `{}`; rejecting it is a semantic check, not a
+            // parse error. See the note on `Selector`.
+            ("{}", Expr::Log(Selector { matchers: vec![] })),
             (
                 r#"{foo="bar"}"#,
                 Expr::Log(Selector {
@@ -177,6 +180,97 @@ mod tests {
         for (input, want) in cases {
             let got = Parser::parse(input).unwrap_or_else(|e| panic!("input {input:?}: {e}"));
             assert_eq!(got, want, "input: {input:?}");
+        }
+    }
+
+    /// Every input here must fail, and fail for the stated reason.
+    ///
+    /// `ParseError` has no `PartialEq`, so a case cannot name the exact error
+    /// value it wants. It names the error's *shape* instead, via a predicate.
+    #[test]
+    fn parser_selector_errors() {
+        // `fn` pointers rather than closures: every closure has its own
+        // anonymous type, so a table of closures would not typecheck as an array.
+        type Check = fn(&ParseError) -> bool;
+
+        let cases: [(&str, Check, &str); 10] = [
+            (
+                r#"{foo="bar",}"#,
+                |e| matches!(e, ParseError::UnexpectedToken(Token::CloseBrace, _)),
+                "trailing comma: the separator promises another matcher",
+            ),
+            (
+                r#"{foo="bar" bar="baz"}"#,
+                |e| matches!(e, ParseError::UnexpectedToken(Token::Identifier(n), Token::CloseBrace) if n == "bar"),
+                "missing comma between matchers",
+            ),
+            (
+                r#"{foo="bar"} garbage"#,
+                |e| matches!(e, ParseError::UnexpectedToken(Token::Identifier(n), Token::EOL) if n == "garbage"),
+                "trailing input after a complete query",
+            ),
+            (
+                r#"{foo="bar""#,
+                |e| {
+                    matches!(
+                        e,
+                        ParseError::UnexpectedToken(Token::EOL, Token::CloseBrace)
+                    )
+                },
+                "unterminated selector",
+            ),
+            (
+                // `selector` only skips the matcher list when it peeks a `}`, so
+                // here it commits to a matcher and reports the missing label
+                // rather than the missing brace. Loki's goyacc agrees:
+                // "unexpected $end, expecting IDENTIFIER".
+                "{",
+                |e| {
+                    matches!(
+                        e,
+                        ParseError::UnexpectedToken(Token::EOL, Token::Identifier(_))
+                    )
+                },
+                "lone opening brace",
+            ),
+            (
+                r#"{="bar"}"#,
+                |e| {
+                    matches!(
+                        e,
+                        ParseError::UnexpectedToken(Token::Eq, Token::Identifier(_))
+                    )
+                },
+                "matcher without a label name",
+            ),
+            (
+                r#"{foo "bar"}"#,
+                |e| matches!(e, ParseError::UnexpectedToken(Token::String(v), _) if v == "bar"),
+                "matcher without an operator",
+            ),
+            (
+                "{foo=bar}",
+                |e| matches!(e, ParseError::UnexpectedToken(Token::Identifier(n), Token::String(_)) if n == "bar"),
+                "unquoted matcher value",
+            ),
+            (
+                r#"foo="bar""#,
+                |e| matches!(e, ParseError::UnexpectedToken(Token::Identifier(n), Token::OpenBrace) if n == "foo"),
+                "no opening brace: a query must start with a selector",
+            ),
+            (
+                // Scanner-level failures must surface through the parser too.
+                r#"{foo="bar}"#,
+                |e| matches!(e, ParseError::UnexpectedEOL),
+                "unterminated string literal",
+            ),
+        ];
+
+        for (input, is_expected, why) in cases {
+            match Parser::parse(input) {
+                Ok(expr) => panic!("input {input:?} ({why}): expected an error, got {expr:?}"),
+                Err(e) => assert!(is_expected(&e), "input {input:?} ({why}): got {e:?}"),
+            }
         }
     }
 }
