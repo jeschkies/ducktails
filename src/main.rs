@@ -1,10 +1,6 @@
-mod error;
-mod parser;
-mod scanner;
-
-use crate::parser::Parser;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser as ClapParser};
+use ducktails::parser::Parser;
 
 /// Like DuckDB but for logs.
 ///
@@ -30,7 +26,9 @@ fn parse_source(s: &str) -> Result<String, String> {
         return Err("must not be empty".to_string());
     }
 
-    // TODO(human)
+    // Deliberately no existence check: `/var/log/*.log` is a valid source and
+    // not a path that exists, and `/dev/stdin` is not a regular file. Whatever
+    // resolves the glob is the only thing that can report "no such file".
     Ok(s.to_string())
 }
 
