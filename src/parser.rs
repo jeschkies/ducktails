@@ -62,6 +62,9 @@ impl Parser {
         while scanner.peek_token()? != Token::CloseBrace {
             let m = Parser::matcher(scanner)?;
             matchers.push(m);
+            if scanner.peek_token()? == Token::Comma {
+                scanner.next_token()?;
+            }
         }
         // consume CloseBrace
         scanner.next_token()?;
@@ -70,10 +73,30 @@ impl Parser {
     }
 
     fn matcher(scanner: &mut Scanner<'_>) -> Result<Matcher, ParseError> {
-        if let Token::Identifier(_identifier) = scanner.next_token()? {
-            todo!("expect operator and value")
-        } else {
-            return Err(ParseError::UnexpectedEOL); // TODO: create custom error
+        match scanner.next_token()? {
+            Token::Identifier(name) => {
+                let op = match scanner.next_token()? {
+                    Token::Eq => MatchOp::Eq,
+                    Token::Neq => MatchOp::Neq,
+                    Token::Re => MatchOp::Re,
+                    Token::Nre => MatchOp::Nre,
+                    other => return Err(ParseError::UnexpectedToken(other, Token::Eq)), // TODO: !=, =~, !~
+                };
+                let value = match scanner.next_token()? {
+                    Token::String(v) => v,
+                    other => {
+                        return Err(ParseError::UnexpectedToken(
+                            other,
+                            Token::String("string".into()),
+                        ));
+                    }
+                };
+                Ok(Matcher { name, op, value })
+            }
+            other => Err(ParseError::UnexpectedToken(
+                other,
+                Token::Identifier("Identifier".into()),
+            )),
         }
     }
 }

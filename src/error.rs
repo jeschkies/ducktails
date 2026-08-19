@@ -13,7 +13,7 @@ impl fmt::Display for ParseError {
         match self {
             ParseError::UnexpectedChar(t) => write!(f, "Unexpected char: {t}"),
             ParseError::UnexpectedToken(actual, expected) => {
-                write!(f, "Unexpected token: {actual}, expected: {expected}")
+                write!(f, "Unexpected token: '{actual}', expected: {expected}")
             }
             ParseError::UnexpectedEOL => write!(f, "Unexpected end of line"),
         }
