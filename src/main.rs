@@ -3,9 +3,10 @@ mod parser;
 mod scanner;
 
 use crate::parser::Parser;
-use clap::Parser as ClapParser;
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser as ClapParser};
 
-/// Simple program to greet a person
+/// Like DuckDB but for logs.
 #[derive(ClapParser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
@@ -17,6 +18,8 @@ struct Cli {
 fn main() {
     let args = Cli::parse();
 
-    let expr = Parser::parse(args.query.as_str()).unwrap();
-    println!("{:?}", expr)
+    match Parser::parse(&args.query) {
+        Ok(expr) => println!("{expr:?}"),
+        Err(e) => Cli::command().error(ErrorKind::ValueValidation, e).exit(),
+    }
 }
