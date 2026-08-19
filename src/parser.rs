@@ -156,6 +156,23 @@ mod tests {
                     ],
                 }),
             ),
+            (
+                r#"{foo=~"bar", bar!~"baz"}"#,
+                Expr::Log(Selector {
+                    matchers: vec![
+                        Matcher {
+                            name: "foo".into(),
+                            op: MatchOp::Re,
+                            value: "bar".into(),
+                        },
+                        Matcher {
+                            name: "bar".into(),
+                            op: MatchOp::Nre,
+                            value: "baz".into(),
+                        },
+                    ],
+                }),
+            ),
         ];
         for (input, want) in cases {
             let got = Parser::parse(input).unwrap_or_else(|e| panic!("input {input:?}: {e}"));
