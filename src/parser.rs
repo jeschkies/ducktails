@@ -53,26 +53,69 @@ impl Parser {
 
     /// Parse `{ name op "value", ... }`.
     fn selector(scanner: &mut Scanner<'_>) -> Result<Selector, ParseError> {
-        // TODO(human): drive the scanner to build a Selector.
-        //
-        // Shape, from `syntax.y`:
-        //     selector: '{' matchers '}' | '{' '}'
-        //     matchers: matcher | matchers ',' matcher
-        //     matcher:  IDENTIFIER (= | != | =~ | !~) STRING
-        //
-        // Two decisions to make, and they are the interesting part:
-        //
-        //  1. `Scanner` yields `Token`, which has no `Identifier` or `String`
-        //     variant yet. Do you extend `Token` with payload-carrying variants
-        //     (`Identifier(String)`, `Str(String)`), or have the parser call
-        //     `scanner.advance()` directly to read them? The first keeps all
-        //     lexing in the scanner; the second avoids owning Strings per token.
-        //
-        //  2. `ParseError` currently only speaks in `char`s
-        //     (`UnexpectedToken(char)`). A parser needs to say "expected `}`,
-        //     found `,`" — so it likely wants a `Token`-level variant. What
-        //     should that look like?
-        let _ = scanner;
-        todo!("parse a stream selector")
+        let t = scanner.next_token()?;
+        if t != Token::OpenBrace {
+            return Err(ParseError::UnexpectedToken(t, Token::OpenBrace));
+        }
+
+        let mut matchers = Vec::new();
+        while scanner.peek_token()? != Token::CloseBrace {
+            let m = Parser::matcher(scanner)?;
+            matchers.push(m);
+        }
+        // consume CloseBrace
+        scanner.next_token()?;
+
+        Ok(Selector { matchers })
+    }
+
+    fn matcher(scanner: &mut Scanner<'_>) -> Result<Matcher, ParseError> {
+        if let Token::Identifier(_identifier) = scanner.next_token()? {
+            todo!("expect operator and value")
+        } else {
+            return Err(ParseError::UnexpectedEOL); // TODO: create custom error
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parser_selector() {
+        let cases = [
+            (
+                r#"{foo="bar"}"#,
+                Expr::Log(Selector {
+                    matchers: vec![Matcher {
+                        name: "foo".into(),
+                        op: MatchOp::Eq,
+                        value: "bar".into(),
+                    }],
+                }),
+            ),
+            (
+                r#"{foo="bar", bar!="baz"}"#,
+                Expr::Log(Selector {
+                    matchers: vec![
+                        Matcher {
+                            name: "foo".into(),
+                            op: MatchOp::Eq,
+                            value: "bar".into(),
+                        },
+                        Matcher {
+                            name: "bar".into(),
+                            op: MatchOp::Neq,
+                            value: "baz".into(),
+                        },
+                    ],
+                }),
+            ),
+        ];
+        for (input, want) in cases {
+            let got = Parser::parse(input).unwrap_or_else(|e| panic!("input {input:?}: {e}"));
+            assert_eq!(got, want, "input: {input:?}");
+        }
     }
 }

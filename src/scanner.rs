@@ -1,3 +1,5 @@
+use std::fmt;
+
 use crate::error::ParseError;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20,6 +22,36 @@ pub enum Token {
 
     Identifier(String),
     String(String),
+}
+
+/// Renders a token as it appears in source, so error messages can quote the
+/// user's own syntax back at them. Deliberately exhaustive: adding a `Token`
+/// variant should fail to compile until it is spelled here too.
+impl fmt::Display for Token {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Token::Comma => f.write_str(","),
+            Token::Dot => f.write_str("."),
+            Token::OpenBrace => f.write_str("{"),
+            Token::CloseBrace => f.write_str("}"),
+            Token::Eq => f.write_str("="),
+            Token::Neq => f.write_str("!="),
+            Token::Re => f.write_str("=~"),
+            Token::Nre => f.write_str("!~"),
+            Token::Npa => f.write_str("!>"),
+            Token::PipeExact => f.write_str("|="),
+            Token::PipeMatch => f.write_str("|~"),
+            Token::PipePattern => f.write_str("|>"),
+            Token::Pipe => f.write_str("|"),
+            Token::OpenParenthesis => f.write_str("("),
+            Token::CloseParenthesis => f.write_str(")"),
+
+            Token::Identifier(name) => f.write_str(name),
+            // `{:?}` on a str re-adds the quotes and escapes, which is close
+            // enough to LogQL's Go-style string syntax.
+            Token::String(value) => write!(f, "{value:?}"),
+        }
+    }
 }
 
 pub struct Scanner<'a> {
@@ -54,10 +86,17 @@ impl<'a> Scanner<'a> {
             '|' => Ok(Token::Pipe),
 
             '"' => self.string(),
-            c if c.is_ascii_whitespace() || c == ':' || c == '_' => self.identifier(c),
+            c if c.is_ascii_alphabetic() || c == ':' || c == '_' => self.identifier(c),
 
-            other => Err(ParseError::UnexpectedToken(other)),
+            other => Err(ParseError::UnexpectedChar(other)),
         }
+    }
+
+    pub fn peek_token(&mut self) -> Result<Token, ParseError> {
+        let saved = self.source;
+        let result = self.next_token();
+        self.source = saved; // rewind
+        result
     }
 
     fn skip_trivia(&mut self) {
@@ -214,7 +253,7 @@ mod tests {
             let input = c.to_string();
             let got = Scanner::new(&input).next_token();
             assert!(
-                matches!(got, Err(ParseError::UnexpectedToken(g)) if g == c),
+                matches!(got, Err(ParseError::UnexpectedChar(g)) if g == c),
                 "input {input:?}: got {got:?}"
             );
         }
@@ -227,7 +266,7 @@ mod tests {
         for input in ["!", "!x"] {
             let got = Scanner::new(input).next_token();
             assert!(
-                matches!(got, Err(ParseError::UnexpectedToken('!'))),
+                matches!(got, Err(ParseError::UnexpectedChar('!'))),
                 "input {input:?}: got {got:?}"
             );
         }
