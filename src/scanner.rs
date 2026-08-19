@@ -54,7 +54,7 @@ impl<'a> Scanner<'a> {
             '|' => Ok(Token::Pipe),
 
             '"' => self.string(),
-            c if c.is_alphabetic() => self.identifier(),
+            c if c.is_ascii_whitespace() || c == ':' || c == '_' => self.identifier(c),
 
             other => Err(ParseError::UnexpectedToken(other)),
         }
@@ -85,11 +85,42 @@ impl<'a> Scanner<'a> {
     }
 
     pub fn string(&mut self) -> Result<Token, ParseError> {
-        todo!("implement string token")
+        let mut value = String::new();
+        loop {
+            match self.advance().ok_or(ParseError::UnexpectedEOL)? {
+                '"' => return Ok(Token::String(value)),
+                '\\' => {
+                    let esc = self.advance().ok_or(ParseError::UnexpectedEOL)?;
+                    value.push(match esc {
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        '\\' => '\\',
+                        '"' => '"',
+                        other => other,
+                    });
+                }
+                other => value.push(other),
+            }
+        }
     }
 
-    pub fn identifier(&mut self) -> Result<Token, ParseError> {
-        todo!("implement identifier token")
+    fn is_label_cont(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_' || c == ':'
+    }
+
+    pub fn identifier(&mut self, first: char) -> Result<Token, ParseError> {
+        let end = self
+            .source
+            .find(|c: char| !Scanner::is_label_cont(c))
+            .unwrap_or(self.source.len()); // all remaining chars are valid
+        let (rest, tail) = self.source.split_at(end);
+        self.source = tail;
+
+        let mut name = String::with_capacity(1 + rest.len());
+        name.push(first);
+        name.push_str(rest);
+        Ok(Token::Identifier(name))
     }
 }
 
@@ -129,6 +160,7 @@ mod tests {
             ("|~", Token::PipeMatch),
             ("|>", Token::PipePattern),
             ("|", Token::Pipe),
+            ("\"foo\"", Token::String("foo".into())),
         ];
         for (input, want) in cases {
             let got = Scanner::new(input)
