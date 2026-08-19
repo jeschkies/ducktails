@@ -52,7 +52,7 @@ impl<'a> Parser<'a> {
             scanner: Scanner::new(query),
         };
         let selector = p.selector()?;
-        p.expect(Token::EOL)?;
+        p.expect(Token::Eol)?;
         Ok(Expr::Log(selector))
     }
 
@@ -206,7 +206,7 @@ mod tests {
             ),
             (
                 r#"{foo="bar"} garbage"#,
-                |e| matches!(e, ParseError::UnexpectedToken(Token::Identifier(n), Token::EOL) if n == "garbage"),
+                |e| matches!(e, ParseError::UnexpectedToken(Token::Identifier(n), Token::Eol) if n == "garbage"),
                 "trailing input after a complete query",
             ),
             (
@@ -214,7 +214,7 @@ mod tests {
                 |e| {
                     matches!(
                         e,
-                        ParseError::UnexpectedToken(Token::EOL, Token::CloseBrace)
+                        ParseError::UnexpectedToken(Token::Eol, Token::CloseBrace)
                     )
                 },
                 "unterminated selector",
@@ -228,7 +228,7 @@ mod tests {
                 |e| {
                     matches!(
                         e,
-                        ParseError::UnexpectedToken(Token::EOL, Token::Identifier(_))
+                        ParseError::UnexpectedToken(Token::Eol, Token::Identifier(_))
                     )
                 },
                 "lone opening brace",
