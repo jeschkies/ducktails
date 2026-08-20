@@ -32,7 +32,8 @@ fn parse_source(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
     match Parser::parse(&cli.query) {
