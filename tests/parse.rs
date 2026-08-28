@@ -5,7 +5,8 @@ use ducktails::parser::{Expr, MatchOp, Parser};
 
 #[test]
 fn parses_a_selector_through_the_public_api() {
-    let Expr::Log(selector) = Parser::parse(r#"{filename=~".*app.*"}"#).expect("should parse");
+    let Expr::Log(query) = Parser::parse(r#"{filename=~".*app.*"}"#).expect("should parse");
+    let selector = query.selector;
 
     assert_eq!(selector.matchers.len(), 1);
     assert_eq!(selector.matchers[0].name, "filename");
