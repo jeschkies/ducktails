@@ -1448,9 +1448,13 @@ dependencies = [
 name = "ducktails"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "clap",
  "datafusion",
+ "datafusion-datasource",
+ "glob",
+ "tempfile",
  "tokio",
 ]
 

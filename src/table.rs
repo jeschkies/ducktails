@@ -1,7 +1,8 @@
+use async_trait::async_trait;
 use chrono::Utc;
-use std::{fs::read_to_string, sync::Arc};
+use glob::glob;
+use std::{fs::read_to_string, path::PathBuf, sync::Arc};
 
-// This is a stub for a provider table provider in the future.
 use datafusion::{
     arrow::{
         array::{
@@ -9,8 +10,13 @@ use datafusion::{
         },
         datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit},
     },
+    catalog::{Session, TableProvider},
+    datasource::TableType,
     error::{DataFusionError, Result},
+    logical_expr::Expr,
+    physical_plan::ExecutionPlan,
 };
+use datafusion_datasource::memory::MemorySourceConfig;
 
 fn label_fields() -> Fields {
     Fields::from(vec![
@@ -70,6 +76,70 @@ pub fn read_source(path: &str) -> Result<RecordBatch> {
             Arc::new(filename_builder.finish()),
         ],
     )?)
+}
+
+/// A DataFusion table backed by log files matched from a shell-style glob.
+///
+/// Each `scan` re-resolves the glob, so files that appear between queries show
+/// up on the next one — matching how log rotation actually works.
+#[derive(Debug)]
+pub struct LogTable {
+    schema: SchemaRef,
+    pattern: String,
+}
+
+impl LogTable {
+    pub fn new(pattern: impl Into<String>) -> Self {
+        Self {
+            schema: log_schema(),
+            pattern: pattern.into(),
+        }
+    }
+
+    fn resolve_files(&self) -> Result<Vec<PathBuf>> {
+        let mut paths = glob(&self.pattern)
+            .map_err(|e| {
+                DataFusionError::Execution(format!("invalid glob {:?}: {e}", self.pattern))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| {
+                DataFusionError::from(std::io::Error::from(e))
+                    .context(format!("resolving {}", self.pattern))
+            })?;
+        paths.sort();
+        Ok(paths)
+    }
+}
+
+#[async_trait]
+impl TableProvider for LogTable {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let files = self.resolve_files()?;
+        let batches = files
+            .iter()
+            .map(|p| read_source(&p.to_string_lossy()))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(MemorySourceConfig::try_new_exec(
+            &[batches],
+            self.schema(),
+            projection.cloned(),
+        )?)
+    }
 }
 
 #[cfg(test)]
