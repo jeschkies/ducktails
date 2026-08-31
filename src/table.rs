@@ -55,7 +55,6 @@ pub fn read_source(path: &str) -> Result<RecordBatch> {
     let mut labels_builder = ListBuilder::new(StructBuilder::from_fields(label_fields(), 0));
     let mut filename_builder = StringBuilder::new();
 
-    // TODO: support glob
     let ingested_at = Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let contents = read_to_string(path)
         .map_err(|e| DataFusionError::from(e).context(format!("reading {path}")))?;
@@ -140,12 +139,4 @@ impl TableProvider for LogTable {
             projection.cloned(),
         )?)
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_read_source() {}
 }

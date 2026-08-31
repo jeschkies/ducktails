@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn skips_whitespace_between_tokens() {
-        // LogQL is whitespace-insensitive between tokens. See TODO(human) in next_token.
+        // LogQL is whitespace-insensitive between tokens; `skip_trivia` handles it.
         let got = scan_all("{ } , ( )").expect("should scan");
         assert_eq!(
             got,

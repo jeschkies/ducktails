@@ -1,6 +1,5 @@
 //! Integration tests for `LogTable`, the DataFusion `TableProvider` backing
-//! text log files. SQL is the test harness because LogQL→plan translation
-//! isn't wired yet; the CLI itself never sees SQL.
+//! text log files. SQL is the test harness because to be independent of logical planning; the CLI won't support SQL.
 
 use std::sync::Arc;
 
