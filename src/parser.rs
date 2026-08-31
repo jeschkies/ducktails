@@ -316,6 +316,67 @@ mod tests {
                     ],
                 }),
             ),
+            (
+                r#"{foo="bar"} |= "baz" |~ "blip" != "flip" !~ "flap""#,
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![Matcher {
+                            name: "foo".into(),
+                            op: MatchOp::Eq,
+                            value: "bar".into(),
+                        }],
+                    },
+                    pipeline: vec![
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Contains,
+                            value: "baz".into(),
+                        }),
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Re,
+                            value: "blip".into(),
+                        }),
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::NotContains,
+                            value: "flip".into(),
+                        }),
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Nre,
+                            value: "flap".into(),
+                        }),
+                    ],
+                }),
+            ),
+            /* |> !>
+            (
+                r#"{foo="bar", bar!="baz"} |> "<_>" !> "<_> <_>""#,
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![
+                            Matcher {
+                                name: "foo".into(),
+                                op: MatchOp::Eq,
+                                value: "bar".into(),
+                            },
+                            Matcher {
+                                name: "bar".into(),
+                                op: MatchOp::Neq,
+                                value: "baz".into(),
+                            },
+                        ],
+                    },
+                    pipeline: vec![
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::NotContains,
+                            value: "bip".into(),
+                        }),
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Nre,
+                            value: ".+bop".into(),
+                        }),
+                    ],
+                }),
+            ),
+            */
         ];
         for (input, want) in cases {
             let got = Parser::parse(input).unwrap_or_else(|e| panic!("input {input:?}: {e}"));
