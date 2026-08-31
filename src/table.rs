@@ -105,6 +105,14 @@ impl LogTable {
                 DataFusionError::from(std::io::Error::from(e))
                     .context(format!("resolving {}", self.pattern))
             })?;
+
+        if paths.is_empty() {
+            return Err(DataFusionError::Execution(format!(
+                "no files match {:?}",
+                self.pattern
+            )));
+        }
+
         paths.sort();
         Ok(paths)
     }
