@@ -4,6 +4,7 @@
 //! logfmt` or `| json` stage becomes a `Projection` that replaces the `labels`
 //! column (DESIGN.md §3).
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -101,7 +102,7 @@ impl ScalarUDFImpl for LogfmtParse {
 ///
 /// Borrowed from `line` rather than allocating: the caller copies into Arrow
 /// buffers immediately, so no owned `String`s are needed.
-fn parse_logfmt(line: &str) -> Vec<(&str, &str)> {
+fn parse_logfmt<'a>(line: &'a str) -> Vec<(&'a str, Cow<'a, str>)> {
     let mut labels = Vec::new();
     let mut remainder = line.trim_start();
     while let Some(pair) = next_pair(&mut remainder) {
@@ -110,7 +111,7 @@ fn parse_logfmt(line: &str) -> Vec<(&str, &str)> {
     labels
 }
 
-fn next_pair<'a>(line: &mut &'a str) -> Option<(&'a str, &'a str)> {
+fn next_pair<'a>(line: &mut &'a str) -> Option<(&'a str, Cow<'a, str>)> {
     if line.is_empty() {
         return None;
     }
@@ -133,20 +134,46 @@ fn next_key<'a>(line: &mut &'a str) -> Option<&'a str> {
     Some(key)
 }
 
-fn next_value<'a>(line: &mut &'a str) -> Option<&'a str> {
-    let end = if eat(line, '"') {
-        line.find('"')
+fn next_value<'a>(line: &mut &'a str) -> Option<Cow<'a, str>> {
+    if eat(line, '"') {
+        if line.contains(r#"\""#) {
+            unescaped_quoted_value(line)
+        } else {
+            quoted_value(line)
+        }
     } else {
-        line.find(char::is_whitespace)
-    };
+        unquoted_value(line)
+    }
+}
 
-    if let Some(value_end) = end {
-        let v = &line[..value_end];
-        *line = &line[value_end..];
-        eat(line, '"');
-        Some(v)
+fn quoted_value<'a>(line: &mut &'a str) -> Option<Cow<'a, str>> {
+    if let Some(end) = line.find('"') {
+        let v = &line[..end];
+        *line = &line[end + 1..]; // eat "
+        Some(Cow::Borrowed(v))
     } else {
-        Some(&line[..line.len()])
+        Some(Cow::Borrowed(&line[..line.len()])) // TODO: error missing end quote
+    }
+}
+
+fn unescaped_quoted_value<'a>(line: &mut &'a str) -> Option<Cow<'a, str>> {
+    // TODO: unescape "
+    if let Some(end) = line.find('"') {
+        let v = &line[..end];
+        *line = &line[end + 1..]; // eat "
+        Some(Cow::Borrowed(v))
+    } else {
+        Some(Cow::Borrowed(&line[..line.len()])) // TODO: error missing end quote
+    }
+}
+
+fn unquoted_value<'a>(line: &mut &'a str) -> Option<Cow<'a, str>> {
+    if let Some(end) = line.find(char::is_whitespace) {
+        let v = &line[..end];
+        *line = &line[end..];
+        Some(Cow::Borrowed(v))
+    } else {
+        Some(Cow::Borrowed(&line[..line.len()]))
     }
 }
 
