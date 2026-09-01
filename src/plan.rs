@@ -11,15 +11,23 @@ use datafusion::common::TableReference;
 use datafusion::datasource::provider_as_source;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::functions::expr_fn::contains;
+use datafusion::functions_nested::expr_fn::array_concat;
 use datafusion::logical_expr::{
     Expr as DfExpr, LogicalPlan, LogicalPlanBuilder, Operator, binary_expr, col, lit, not,
 };
 
 use crate::parser::{Expr, LineFilter, LineFilterOp, MatchOp, Matcher, Selector, Stage};
 use crate::table::LogTable;
+use crate::udf::logfmt_parse;
 
 /// The column holding the raw log line — what line filters apply to.
 const LINE: &str = "line";
+
+/// Monotonic line index (§6), carried through projections to preserve order.
+const TIMESTAMP: &str = "timestamp";
+
+/// `List<Struct<key, value>>` — appended to by parser stages, read by label filters.
+const LABELS: &str = "labels";
 
 /// The only label available before a pipeline stage populates `labels`, per
 /// DESIGN.md §2. A plain text file carries no labels of its own.
@@ -45,6 +53,19 @@ pub fn plan(source: &str, query: &Expr) -> Result<LogicalPlan> {
     for stage in &log_query.pipeline {
         builder = match stage {
             Stage::Line(filter) => builder.filter(line_predicate(filter))?,
+            // A parser stage is a `Projection`, not a `Filter`: it rewrites
+            // `labels` and leaves the row count alone.
+            //
+            // `labels` accumulates rather than being replaced, so chained parser
+            // stages each see the previous stage's output — as Loki does. Not yet
+            // implemented: Loki suffixes a colliding key with `_extracted`, so
+            // duplicates currently survive and precedence is undefined.
+            Stage::Logfmt => builder.project(vec![
+                col(TIMESTAMP),
+                col(LINE),
+                array_concat(vec![col(LABELS), logfmt_parse().call(vec![col(LINE)])]).alias(LABELS),
+                col(FILENAME),
+            ])?,
         };
     }
 

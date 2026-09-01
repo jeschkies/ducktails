@@ -8,3 +8,4 @@ pub mod parser;
 pub mod plan;
 pub mod scanner;
 pub mod table;
+pub mod udf;

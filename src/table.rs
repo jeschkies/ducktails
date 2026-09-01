@@ -18,16 +18,28 @@ use datafusion::{
 };
 use datafusion_datasource::memory::MemorySourceConfig;
 
-fn label_fields() -> Fields {
+pub fn label_fields() -> Fields {
     Fields::from(vec![
         Field::new("key", DataType::Utf8, false),
         Field::new("value", DataType::Utf8, true),
     ])
 }
 
-pub fn log_schema() -> SchemaRef {
-    let labels_pair_struct = DataType::Struct(label_fields());
+/// The type of the `labels` column: `List<Struct<key, value>>`, per DESIGN.md §1.
+///
+/// Shared so the schema and anything producing labels — `logfmt_parse`, later
+/// `json_parse` — agree by construction. The inner field's name (`item`) and
+/// nullability are part of the `DataType`, so a mismatch here is a runtime
+/// schema error at `RecordBatch::try_new`, not a compile error.
+pub fn labels_type() -> DataType {
+    DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::Struct(label_fields()),
+        true,
+    )))
+}
 
+pub fn log_schema() -> SchemaRef {
     let schema = Schema::new(vec![
         Field::new(
             "timestamp",
@@ -35,11 +47,7 @@ pub fn log_schema() -> SchemaRef {
             false,
         ),
         Field::new("line", DataType::Utf8, false),
-        Field::new(
-            "labels",
-            DataType::List(Arc::new(Field::new("item", labels_pair_struct, true))),
-            true,
-        ),
+        Field::new("labels", labels_type(), true),
         Field::new("filename", DataType::Utf8, false),
     ]);
 

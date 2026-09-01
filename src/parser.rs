@@ -54,7 +54,8 @@ pub struct LineFilter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stage {
     Line(LineFilter),
-} // Json / Logfmt / LabelFilter later
+    Logfmt,
+} // Json / LabelFilter later
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogQuery {
@@ -170,7 +171,19 @@ impl<'a> Parser<'a> {
 
     /// Parse `|= "Debug"` or `| Json` or `!~ "Fatal|Info"` etc.
     fn stage(&mut self) -> Result<Option<Stage>, ParseError> {
-        Ok(self.line_filter()?.map(Stage::Line))
+        match self.scanner.peek_token()? {
+            Token::Pipe => {
+                self.scanner.next_token()?; // eat previous pipe token
+                match self.scanner.next_token()? {
+                    Token::Identifier(id) if id == "logfmt" => Ok(Some(Stage::Logfmt)),
+                    other => Err(ParseError::UnexpectedToken(
+                        other,
+                        Token::Identifier("identifier".into()),
+                    )),
+                }
+            }
+            _ => Ok(self.line_filter()?.map(Stage::Line)),
+        }
     }
 
     fn line_filter(&mut self) -> Result<Option<LineFilter>, ParseError> {
@@ -339,6 +352,29 @@ mod tests {
                             op: LineFilterOp::NotContains,
                             value: "flip".into(),
                         }),
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Nre,
+                            value: "flap".into(),
+                        }),
+                    ],
+                }),
+            ),
+            (
+                r#"{foo="bar"} |= "baz" | logfmt !~ "flap""#,
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![Matcher {
+                            name: "foo".into(),
+                            op: MatchOp::Eq,
+                            value: "bar".into(),
+                        }],
+                    },
+                    pipeline: vec![
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Contains,
+                            value: "baz".into(),
+                        }),
+                        Stage::Logfmt,
                         Stage::Line(LineFilter {
                             op: LineFilterOp::Nre,
                             value: "flap".into(),

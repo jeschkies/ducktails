@@ -6,6 +6,7 @@
 mod common;
 
 use common::two_log_files;
+use datafusion::arrow::array::AsArray;
 use datafusion::{assert_batches_eq, error::Result, logical_expr::col, prelude::SessionContext};
 use ducktails::{parser::Parser, plan::plan};
 
@@ -98,7 +99,7 @@ async fn every_line_filter_operator() -> Result<()> {
         let got: Vec<String> = batches
             .iter()
             .flat_map(|b| {
-                let column = datafusion::arrow::array::AsArray::as_string::<i32>(b.column(0));
+                let column = b.column(0).as_string::<i32>();
                 (0..b.num_rows())
                     .map(|i| column.value(i).to_string())
                     .collect::<Vec<_>>()
