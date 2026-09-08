@@ -27,6 +27,26 @@ pub fn two_log_files() -> (TempDir, String) {
     (dir, pattern)
 }
 
+/// One log file of logfmt lines, and a glob matching it.
+///
+/// Deliberately uneven: the keys differ per line, one value is quoted and
+/// contains a space, and the last line is not logfmt at all — so a parser stage
+/// has to cope with a line it cannot read.
+pub fn logfmt_log_file() -> (TempDir, String) {
+    let dir = tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("app.log"),
+        concat!(
+            "level=info msg=started\n",
+            "level=error msg=\"went wrong\" code=500\n",
+            "not logfmt at all\n",
+        ),
+    )
+    .expect("write app.log");
+    let pattern = dir.path().join("*.log").to_string_lossy().into_owned();
+    (dir, pattern)
+}
+
 /// A context with the glob registered as `logs`, for driving `LogTable` from SQL.
 ///
 /// Only the SQL tests need this: a plan built by `ducktails::plan` carries its

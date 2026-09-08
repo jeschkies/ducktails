@@ -5,13 +5,17 @@
 
 mod common;
 
-use common::two_log_files;
-use datafusion::arrow::array::AsArray;
+use common::{logfmt_log_file, two_log_files};
+use datafusion::arrow::array::{Array, AsArray};
 use datafusion::{assert_batches_eq, error::Result, logical_expr::col, prelude::SessionContext};
 use ducktails::{parser::Parser, plan::plan};
 
-/// Runs `query` over `pattern` and returns the `line` column in file order.
-async fn lines(pattern: &str, query: &str) -> Result<Vec<datafusion::arrow::array::RecordBatch>> {
+/// Runs `query` over `pattern` and returns `columns` in file order.
+async fn run(
+    pattern: &str,
+    query: &str,
+    columns: &[&str],
+) -> Result<Vec<datafusion::arrow::array::RecordBatch>> {
     let ast = Parser::parse(query).expect("test query must parse");
     let logical_plan = plan(pattern, &ast)?;
 
@@ -19,9 +23,14 @@ async fn lines(pattern: &str, query: &str) -> Result<Vec<datafusion::arrow::arra
         .execute_logical_plan(logical_plan)
         .await?
         .sort_by(vec![col("timestamp")])?
-        .select_columns(&["line"])?
+        .select_columns(columns)?
         .collect()
         .await
+}
+
+/// Runs `query` over `pattern` and returns the `line` column in file order.
+async fn lines(pattern: &str, query: &str) -> Result<Vec<datafusion::arrow::array::RecordBatch>> {
+    run(pattern, query, &["line"]).await
 }
 
 #[tokio::test]
@@ -107,6 +116,61 @@ async fn every_line_filter_operator() -> Result<()> {
             .collect();
         assert_eq!(got, want, "query: {query}");
     }
+    Ok(())
+}
+
+/// `| logfmt` is the first stage that *writes* to `labels` rather than filtering
+/// rows, so this pins the `List<Struct<key,value>>` representation from §1 all
+/// the way through the UDF, `array_concat` and the `Projection`.
+#[tokio::test]
+async fn logfmt_stage_extracts_labels() -> Result<()> {
+    let (_dir, pattern) = logfmt_log_file();
+
+    assert_batches_eq!(
+        &[
+            "+---------------------------------------+--------------------------------------------------------------------------------------+",
+            "| line                                  | labels                                                                               |",
+            "+---------------------------------------+--------------------------------------------------------------------------------------+",
+            "| level=info msg=started                | [{key: level, value: info}, {key: msg, value: started}]                              |",
+            "| level=error msg=\"went wrong\" code=500 | [{key: level, value: error}, {key: msg, value: went wrong}, {key: code, value: 500}] |",
+            "| not logfmt at all                     | []                                                                                   |",
+            "+---------------------------------------+--------------------------------------------------------------------------------------+",
+        ],
+        &run(&pattern, r#"{} | logfmt"#, &["line", "labels"]).await?
+    );
+    Ok(())
+}
+
+/// Without a parser stage `labels` stays empty — a plain text file carries none.
+#[tokio::test]
+async fn labels_are_empty_without_a_parser_stage() -> Result<()> {
+    let (_dir, pattern) = logfmt_log_file();
+
+    let batches = run(&pattern, "{}", &["labels"]).await?;
+    let labels = batches[0].column(0).as_list::<i32>();
+    assert!(
+        (0..labels.len()).all(|i| labels.value(i).is_empty()),
+        "expected no labels before a parser stage, got {:?}",
+        labels
+    );
+    Ok(())
+}
+
+/// A line filter after `| logfmt` still tests the raw line, not the labels.
+#[tokio::test]
+async fn a_line_filter_after_logfmt_still_reads_the_line() -> Result<()> {
+    let (_dir, pattern) = logfmt_log_file();
+
+    assert_batches_eq!(
+        &[
+            "+---------------------------------------+",
+            "| line                                  |",
+            "+---------------------------------------+",
+            "| level=error msg=\"went wrong\" code=500 |",
+            "+---------------------------------------+",
+        ],
+        &lines(&pattern, r#"{} | logfmt |= "code=500""#).await?
+    );
     Ok(())
 }
 
