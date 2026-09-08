@@ -105,13 +105,16 @@ impl ScalarUDFImpl for LogfmtParse {
 fn parse_logfmt<'a>(line: &'a str) -> Vec<(&'a str, Cow<'a, str>)> {
     let mut labels = Vec::new();
     let mut remainder = line.trim_start();
-    while let Some(pair) = next_pair(&mut remainder) {
-        labels.push(pair);
+    while let Some((key, value)) = next_pair(&mut remainder) {
+        match value {
+            Some(v) if !v.is_empty() => labels.push((key, v)),
+            _ => continue,
+        }
     }
     labels
 }
 
-fn next_pair<'a>(line: &mut &'a str) -> Option<(&'a str, Cow<'a, str>)> {
+fn next_pair<'a>(line: &mut &'a str) -> Option<(&'a str, Option<Cow<'a, str>>)> {
     if line.is_empty() {
         return None;
     }
@@ -120,15 +123,15 @@ fn next_pair<'a>(line: &mut &'a str) -> Option<(&'a str, Cow<'a, str>)> {
 
     let key = next_key(line)?;
     if !eat(line, '=') {
-        return None;
+        return Some((key, None));
     };
-    let value = next_value(line)?;
+    let value = next_value(line);
 
     Some((key, value))
 }
 
 fn next_key<'a>(line: &mut &'a str) -> Option<&'a str> {
-    let key_end = line.find('=')?;
+    let key_end = line.find(|c: char| c == '=' || c.is_whitespace())?;
     let key = &line[..key_end];
     *line = &line[key_end..];
     Some(key)
@@ -136,45 +139,79 @@ fn next_key<'a>(line: &mut &'a str) -> Option<&'a str> {
 
 fn next_value<'a>(line: &mut &'a str) -> Option<Cow<'a, str>> {
     if eat(line, '"') {
-        if line.contains(r#"\""#) {
-            unescaped_quoted_value(line)
-        } else {
-            quoted_value(line)
-        }
+        quoted_value(line)
     } else {
         unquoted_value(line)
     }
 }
 
 fn quoted_value<'a>(line: &mut &'a str) -> Option<Cow<'a, str>> {
-    if let Some(end) = line.find('"') {
-        let v = &line[..end];
-        *line = &line[end + 1..]; // eat "
-        Some(Cow::Borrowed(v))
-    } else {
-        Some(Cow::Borrowed(&line[..line.len()])) // TODO: error missing end quote
+    let mut escaped = false; // previous char was a backslash
+    let mut saw_escape = false; // this value contains at least one
+
+    for (i, c) in line.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => {
+                escaped = true;
+                saw_escape = true;
+            }
+            '"' => {
+                let (value, rest) = line.split_at(i);
+                *line = &rest[1..]; // consume the closing quote
+                return Some(if saw_escape {
+                    Cow::Owned(unescape(value)?)
+                } else {
+                    Cow::Borrowed(value)
+                });
+            }
+            _ => {}
+        }
     }
+
+    // Unterminated quote: take the rest, as non-strict logfmt does.
+    Some(Cow::Borrowed(std::mem::take(line)))
 }
 
-fn unescaped_quoted_value<'a>(line: &mut &'a str) -> Option<Cow<'a, str>> {
-    // TODO: unescape "
-    if let Some(end) = line.find('"') {
-        let v = &line[..end];
-        *line = &line[end + 1..]; // eat "
-        Some(Cow::Borrowed(v))
-    } else {
-        Some(Cow::Borrowed(&line[..line.len()])) // TODO: error missing end quote
+/// Resolves the escapes Loki's `unquoteBytes` accepts. `None` on an unknown
+/// escape, matching its `(nil, false)` — non-strict logfmt then drops the pair
+/// rather than inventing a value.
+fn unescape(value: &str) -> Option<String> {
+    // The result is never longer than the input, so one allocation suffices.
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        out.push(match chars.next()? {
+            '"' => '"',
+            '\\' => '\\',
+            '/' => '/',
+            '\'' => '\'',
+            'b' => '\u{8}',
+            'f' => '\u{c}',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'u' => {
+                let hex: String = chars.by_ref().take(4).collect();
+                char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?
+            }
+            _ => return None,
+        });
     }
+
+    Some(out)
 }
 
 fn unquoted_value<'a>(line: &mut &'a str) -> Option<Cow<'a, str>> {
-    if let Some(end) = line.find(char::is_whitespace) {
-        let v = &line[..end];
-        *line = &line[end..];
-        Some(Cow::Borrowed(v))
-    } else {
-        Some(Cow::Borrowed(&line[..line.len()]))
-    }
+    let end = line.find(char::is_whitespace).unwrap_or(line.len());
+    let (value, rest) = line.split_at(end);
+    *line = rest;
+    Some(Cow::Borrowed(value))
 }
 
 fn eat(line: &mut &str, c: char) -> bool {
@@ -190,9 +227,18 @@ fn eat(line: &mut &str, c: char) -> bool {
 mod tests {
     use super::*;
 
+    /// Borrows the pairs as `&str` so the expectations stay readable.
+    ///
+    /// Takes a reference rather than the `Vec` itself: a `Cow::Owned` value's
+    /// `String` lives *in* that `Vec`, so the returned slices borrow from it and
+    /// the caller has to keep it alive.
+    fn as_strs<'a>(pairs: &'a [(&'a str, Cow<'a, str>)]) -> Vec<(&'a str, &'a str)> {
+        pairs.iter().map(|(k, v)| (*k, v.as_ref())).collect()
+    }
+
     #[test]
     fn parses_logfmt_lines() {
-        let cases: [(&str, Vec<(&str, &str)>); 4] = [
+        let cases: [(&str, Vec<(&str, &str)>); 5] = [
             ("", vec![]),
             (
                 "level=info msg=started",
@@ -210,10 +256,14 @@ mod tests {
                 "  level=info   msg=ok  ",
                 vec![("level", "info"), ("msg", "ok")],
             ),
+            (
+                r#"level=info msg="\"ok""#,
+                vec![("level", "info"), ("msg", r#""ok"#)],
+            ),
         ];
 
         for (line, want) in cases {
-            assert_eq!(parse_logfmt(line), want, "line: {line:?}");
+            assert_eq!(as_strs(&parse_logfmt(line)), want, "line: {line:?}");
         }
     }
 
@@ -231,8 +281,7 @@ mod tests {
             // Only the first `=` separates; the rest belongs to the value. And
             // the last pair must consume the cursor, or the leftover text gets
             // re-parsed into a phantom pair.
-            ("msg=hello=world", vec![("msg", "hello=world")]),
-            // An empty value is dropped exactly like a missing one — `parser.go`
+            ("msg=hello=world", vec![("msg", "hello=world")]), // An empty value is dropped exactly like a missing one — `parser.go`
             // has `if !l.keepEmpty && len(val) == 0 { continue }`. That is what
             // `--keep-empty` changes, and we do not support it.
             ("a= b=2", vec![("b", "2")]),
@@ -250,7 +299,7 @@ mod tests {
         ];
 
         for (line, want) in cases {
-            assert_eq!(parse_logfmt(line), want, "line: {line:?}");
+            assert_eq!(as_strs(&parse_logfmt(line)), want, "line: {line:?}");
         }
     }
 }
