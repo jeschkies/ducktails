@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::error::ParseError;
 use crate::scanner::{Scanner, Token};
 
@@ -34,6 +36,33 @@ pub struct Selector {
     pub matchers: Vec<Matcher>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelFilterOp {
+    Eq,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    Neq,
+    Nre,
+    Re,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelValue {
+    String(String), // matcher            = != =~ !~
+    Number(f64),    // numberFilter       = != == > >= < <=
+    Duration(Duration),
+    Bytes(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelFilter {
+    pub label: String,
+    pub op: LabelFilterOp,
+    pub value: LabelValue,
+}
+
 /// `|= "error"`, `!~ "debug|trace"`. Distinct from `MatchOp`: `=` on a label is
 /// equality, `|=` on a line is *containment*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +82,7 @@ pub struct LineFilter {
 /// One stage of a log pipeline. §3 models a pipeline as an ordered sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stage {
+    LabelFilter(LabelFilter),
     Line(LineFilter),
     Logfmt,
 } // Json / LabelFilter later
@@ -176,6 +206,9 @@ impl<'a> Parser<'a> {
                 self.scanner.next_token()?; // eat previous pipe token
                 match self.scanner.next_token()? {
                     Token::Identifier(id) if id == "logfmt" => Ok(Some(Stage::Logfmt)),
+                    Token::Identifier(label) => {
+                        Ok(self.label_filter(label)?.map(Stage::LabelFilter))
+                    }
                     other => Err(ParseError::UnexpectedToken(
                         other,
                         Token::Identifier("identifier".into()),
@@ -205,6 +238,31 @@ impl<'a> Parser<'a> {
             }
         };
         Ok(Some(LineFilter { op, value }))
+    }
+
+    fn label_filter(&mut self, label: String) -> Result<Option<LabelFilter>, ParseError> {
+        let op = match self.scanner.peek_token()? {
+            Token::Eq => LabelFilterOp::Eq,
+            Token::Gt => LabelFilterOp::Gt,
+            Token::Gte => LabelFilterOp::Gte,
+            Token::Lt => LabelFilterOp::Lt,
+            Token::Lte => LabelFilterOp::Lte,
+            Token::Neq => LabelFilterOp::Neq,
+            Token::Nre => LabelFilterOp::Nre,
+            Token::Re => LabelFilterOp::Re,
+            _ => return Ok(None),
+        };
+        self.scanner.next_token()?; // committed now
+        let value = match self.scanner.next_token()? {
+            Token::String(v) => v,
+            other => {
+                return Err(ParseError::UnexpectedToken(
+                    other,
+                    Token::String("string".into()),
+                ));
+            }
+        };
+        Ok(Some(LabelFilter { label, op, value }))
     }
 }
 
@@ -378,6 +436,54 @@ mod tests {
                         Stage::Line(LineFilter {
                             op: LineFilterOp::Nre,
                             value: "flap".into(),
+                        }),
+                    ],
+                }),
+            ),
+            (
+                r#"{foo="bar"} |= "baz" | logfmt | level="error""#,
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![Matcher {
+                            name: "foo".into(),
+                            op: MatchOp::Eq,
+                            value: "bar".into(),
+                        }],
+                    },
+                    pipeline: vec![
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Contains,
+                            value: "baz".into(),
+                        }),
+                        Stage::Logfmt,
+                        Stage::LabelFilter(LabelFilter {
+                            label: "level".into(),
+                            op: LabelFilterOp::Eq,
+                            value: "error".into(),
+                        }),
+                    ],
+                }),
+            ),
+            (
+                r#"{foo="bar"} |= "baz" | logfmt | b>=10GB`"#,
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![Matcher {
+                            name: "foo".into(),
+                            op: MatchOp::Eq,
+                            value: "bar".into(),
+                        }],
+                    },
+                    pipeline: vec![
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Contains,
+                            value: "baz".into(),
+                        }),
+                        Stage::Logfmt,
+                        Stage::LabelFilter(LabelFilter {
+                            label: "level".into(),
+                            op: LabelFilterOp::Eq,
+                            value: "error".into(),
                         }),
                     ],
                 }),

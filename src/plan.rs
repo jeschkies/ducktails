@@ -52,6 +52,14 @@ pub fn plan(source: &str, query: &Expr) -> Result<LogicalPlan> {
     // `| json` will read the output of the filters above it.
     for stage in &log_query.pipeline {
         builder = match stage {
+            // Needs `label_value(labels, name)` (§7) plus the numeric, duration
+            // and bytes comparisons the grammar allows — see §5.
+            Stage::LabelFilter(filter) => {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "label filter on {:?}: label filters are not planned yet",
+                    filter.label
+                )));
+            }
             Stage::Line(filter) => builder.filter(line_predicate(filter))?,
             // A parser stage is a `Projection`, not a `Filter`: it rewrites
             // `labels` and leaves the row count alone.

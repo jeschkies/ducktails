@@ -9,6 +9,10 @@ pub enum Token {
     OpenBrace,
     CloseBrace,
     Eq,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
     Neq,
     Re,
     Nre,
@@ -22,6 +26,10 @@ pub enum Token {
 
     Identifier(String),
     String(String),
+
+    Number(f64),
+    Duration(Duration),
+    Bytes(u64),
 
     Eol,
 }
@@ -38,6 +46,10 @@ impl fmt::Display for Token {
             Token::CloseBrace => f.write_str("}"),
             Token::Eq => f.write_str("="),
             Token::Neq => f.write_str("!="),
+            Token::Gt => f.write_str(">"),
+            Token::Gte => f.write_str(">="),
+            Token::Lt => f.write_str("<"),
+            Token::Lte => f.write_str("<="),
             Token::Re => f.write_str("=~"),
             Token::Nre => f.write_str("!~"),
             Token::Npa => f.write_str("!>"),
@@ -83,6 +95,11 @@ impl<'a> Scanner<'a> {
             '=' if self.eat('~') => Ok(Token::Re), // =~ before =
             '=' => Ok(Token::Eq),
 
+            '>' if self.eat('=') => Ok(Token::Gte),
+            '>' => Ok(Token::Gt),
+            '<' if self.eat('=') => Ok(Token::Lte),
+            '<' => Ok(Token::Lt),
+
             '!' if self.eat('=') => Ok(Token::Neq),
             '!' if self.eat('~') => Ok(Token::Nre),
             '!' if self.eat('>') => Ok(Token::Npa), // !> negated pattern
@@ -94,6 +111,7 @@ impl<'a> Scanner<'a> {
 
             '"' => self.string(),
             c if c.is_ascii_alphabetic() || c == ':' || c == '_' => self.identifier(c),
+            i if i.is_ascii_digit() => self.number_or_identifier(i),
 
             other => Err(ParseError::UnexpectedChar(other)),
         }
@@ -167,6 +185,35 @@ impl<'a> Scanner<'a> {
         name.push(first);
         name.push_str(rest);
         Ok(Token::Identifier(name))
+    }
+
+    // After scanning the digits, try duration first, then bytes, then plain number.
+    fn is_bytes_size_rune(c: char) -> bool {
+        // B kB MB GB TB PB KB KiB MiB GiB TiB PiB.
+        // Deliberately NOT E/Z/Y: Loki excludes them because the value may not fit u64.
+        matches!(c, 'B' | 'i' | 'k' | 'K' | 'M' | 'G' | 'T' | 'P')
+    }
+
+    fn is_duration_rune(c: char) -> bool {
+        // ns, us (or µs), ms, s, m, h, d, w, y
+        matches!(c, 'n' | 'u' | 'µ' | 'm' | 's' | 'h' | 'd' | 'w' | 'y')
+    }
+
+    // parses a number such as 10, 3GiB, 2h or falls back to identifier.
+    pub fn number_or_identifier(&mut self, first: char) -> Result<Token, ParseError> {
+        let end = self
+            .source
+            .find(|c: char| c.is_numeric() || c == '.')
+            .unwrap_or(self.source.len()); // all remaining chars are valid
+        let (rest, tail) = self.source.split_at(end);
+        if let Some(unit_end) = tail.find(|c: char| !Scanner::is_duration_rune(c)) {
+            // try parsing duration unit
+            return Err(ParseError::Unsupported);
+        } else if let Some(unit_end) = tail.find(|c: char| !Scanner::is_bytes_size_rune(c)) {
+            return Err(ParseError::Unsupported);
+        } else {
+            self.identifier(first)
+        }
     }
 }
 
