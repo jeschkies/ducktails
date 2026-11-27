@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::error::ParseError;
 use crate::scanner::{Scanner, Token};
 
@@ -34,11 +36,72 @@ pub struct Selector {
     pub matchers: Vec<Matcher>,
 }
 
-/// The root of a LogQL query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelFilterOp {
+    Eq,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    Neq,
+    Nre,
+    Re,
+}
+
+/// The right-hand side of a label filter, as the scanner typed it.
+///
+/// No `Eq`, here or in anything holding one: `Number` is an `f64`. The scanner
+/// has already resolved units, so `10GB` arrives as `Bytes(10_000_000_000)`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LabelValue {
+    String(String), // matcher            = != =~ !~
+    Number(f64),    // numberFilter       = != == > >= < <=
+    Duration(Duration),
+    Bytes(u64),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelFilter {
+    pub label: String,
+    pub op: LabelFilterOp,
+    pub value: LabelValue,
+}
+
+/// `|= "error"`, `!~ "debug|trace"`. Distinct from `MatchOp`: `=` on a label is
+/// equality, `|=` on a line is *containment*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineFilterOp {
+    Contains,
+    NotContains,
+    Re,
+    Nre,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineFilter {
+    pub op: LineFilterOp,
+    pub value: String,
+}
+
+/// One stage of a log pipeline. §3 models a pipeline as an ordered sequence.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stage {
+    LabelFilter(LabelFilter),
+    Line(LineFilter),
+    Logfmt,
+} // Json / LabelFilter later
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogQuery {
+    pub selector: Selector,
+    pub pipeline: Vec<Stage>,
+}
+
+/// The root of a LogQL query.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// A log query: a selector, later plus a pipeline.
-    Log(Selector),
+    Log(LogQuery),
     // Metric(SampleExpr) — milestone 2, see DESIGN.md §4.
 }
 
@@ -51,9 +114,9 @@ impl<'a> Parser<'a> {
         let mut p = Parser {
             scanner: Scanner::new(query),
         };
-        let selector = p.selector()?;
+        let log_query = p.log_query()?;
         p.expect(Token::Eol)?;
-        Ok(Expr::Log(selector))
+        Ok(Expr::Log(log_query))
     }
 
     fn expect(&mut self, expected: Token) -> Result<(), ParseError> {
@@ -74,6 +137,14 @@ impl<'a> Parser<'a> {
         } else {
             Ok(false)
         }
+    }
+
+    /// Parse `{ name op "value", ... } |= "Debug"`.
+    fn log_query(&mut self) -> Result<LogQuery, ParseError> {
+        let selector = self.selector()?;
+        let pipeline = self.pipeline()?;
+
+        Ok(LogQuery { selector, pipeline })
     }
 
     /// Parse `{ name op "value", ... }`.
@@ -120,6 +191,86 @@ impl<'a> Parser<'a> {
             )),
         }
     }
+
+    /// Parse `|= "Debug" | Json !~ "Fatal|Info"`.
+    fn pipeline(&mut self) -> Result<Vec<Stage>, ParseError> {
+        // TODO: maybe define iterator and use collect
+        let mut stages: Vec<Stage> = vec![];
+        while let Some(next_stage) = self.stage()? {
+            stages.push(next_stage);
+        }
+
+        Ok(stages)
+    }
+
+    /// Parse `|= "Debug"` or `| Json` or `!~ "Fatal|Info"` etc.
+    fn stage(&mut self) -> Result<Option<Stage>, ParseError> {
+        match self.scanner.peek_token()? {
+            Token::Pipe => {
+                self.scanner.next_token()?; // eat previous pipe token
+                match self.scanner.next_token()? {
+                    Token::Identifier(id) if id == "logfmt" => Ok(Some(Stage::Logfmt)),
+                    Token::Identifier(label) => {
+                        Ok(self.label_filter(label)?.map(Stage::LabelFilter))
+                    }
+                    other => Err(ParseError::UnexpectedToken(
+                        other,
+                        Token::Identifier("identifier".into()),
+                    )),
+                }
+            }
+            _ => Ok(self.line_filter()?.map(Stage::Line)),
+        }
+    }
+
+    fn line_filter(&mut self) -> Result<Option<LineFilter>, ParseError> {
+        let op = match self.scanner.peek_token()? {
+            Token::PipeExact => LineFilterOp::Contains,
+            Token::Neq => LineFilterOp::NotContains,
+            Token::PipeMatch => LineFilterOp::Re,
+            Token::Nre => LineFilterOp::Nre,
+            _ => return Ok(None),
+        };
+        self.scanner.next_token()?; // committed now
+        let value = match self.scanner.next_token()? {
+            Token::String(v) => v,
+            other => {
+                return Err(ParseError::UnexpectedToken(
+                    other,
+                    Token::String("string".into()),
+                ));
+            }
+        };
+        Ok(Some(LineFilter { op, value }))
+    }
+
+    fn label_filter(&mut self, label: String) -> Result<Option<LabelFilter>, ParseError> {
+        let op = match self.scanner.peek_token()? {
+            Token::Eq => LabelFilterOp::Eq,
+            Token::Gt => LabelFilterOp::Gt,
+            Token::Gte => LabelFilterOp::Gte,
+            Token::Lt => LabelFilterOp::Lt,
+            Token::Lte => LabelFilterOp::Lte,
+            Token::Neq => LabelFilterOp::Neq,
+            Token::Nre => LabelFilterOp::Nre,
+            Token::Re => LabelFilterOp::Re,
+            _ => return Ok(None),
+        };
+        self.scanner.next_token()?; // committed now
+        let value = match self.scanner.next_token()? {
+            Token::String(v) => LabelValue::String(v),
+            Token::Number(v) => LabelValue::Number(v),
+            Token::Duration(v) => LabelValue::Duration(v),
+            Token::Bytes(v) => LabelValue::Bytes(v),
+            other => {
+                return Err(ParseError::UnexpectedToken(
+                    other,
+                    Token::String("value".into()),
+                ));
+            }
+        };
+        Ok(Some(LabelFilter { label, op, value }))
+    }
 }
 
 #[cfg(test)]
@@ -131,51 +282,291 @@ mod tests {
         let cases = [
             // The grammar admits `{}`; rejecting it is a semantic check, not a
             // parse error. See the note on `Selector`.
-            ("{}", Expr::Log(Selector { matchers: vec![] })),
+            (
+                "{}",
+                Expr::Log(LogQuery {
+                    selector: Selector { matchers: vec![] },
+                    pipeline: vec![],
+                }),
+            ),
             (
                 r#"{foo="bar"}"#,
-                Expr::Log(Selector {
-                    matchers: vec![Matcher {
-                        name: "foo".into(),
-                        op: MatchOp::Eq,
-                        value: "bar".into(),
-                    }],
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![Matcher {
+                            name: "foo".into(),
+                            op: MatchOp::Eq,
+                            value: "bar".into(),
+                        }],
+                    },
+                    pipeline: vec![],
                 }),
             ),
             (
                 r#"{foo="bar", bar!="baz"}"#,
-                Expr::Log(Selector {
-                    matchers: vec![
-                        Matcher {
-                            name: "foo".into(),
-                            op: MatchOp::Eq,
-                            value: "bar".into(),
-                        },
-                        Matcher {
-                            name: "bar".into(),
-                            op: MatchOp::Neq,
-                            value: "baz".into(),
-                        },
-                    ],
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![
+                            Matcher {
+                                name: "foo".into(),
+                                op: MatchOp::Eq,
+                                value: "bar".into(),
+                            },
+                            Matcher {
+                                name: "bar".into(),
+                                op: MatchOp::Neq,
+                                value: "baz".into(),
+                            },
+                        ],
+                    },
+                    pipeline: vec![],
                 }),
             ),
             (
                 r#"{foo=~"bar", bar!~"baz"}"#,
-                Expr::Log(Selector {
-                    matchers: vec![
-                        Matcher {
-                            name: "foo".into(),
-                            op: MatchOp::Re,
-                            value: "bar".into(),
-                        },
-                        Matcher {
-                            name: "bar".into(),
-                            op: MatchOp::Nre,
-                            value: "baz".into(),
-                        },
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![
+                            Matcher {
+                                name: "foo".into(),
+                                op: MatchOp::Re,
+                                value: "bar".into(),
+                            },
+                            Matcher {
+                                name: "bar".into(),
+                                op: MatchOp::Nre,
+                                value: "baz".into(),
+                            },
+                        ],
+                    },
+                    pipeline: vec![],
+                }),
+            ),
+            (
+                r#"{foo="bar", bar!="baz"} != "bip""#,
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![
+                            Matcher {
+                                name: "foo".into(),
+                                op: MatchOp::Eq,
+                                value: "bar".into(),
+                            },
+                            Matcher {
+                                name: "bar".into(),
+                                op: MatchOp::Neq,
+                                value: "baz".into(),
+                            },
+                        ],
+                    },
+                    pipeline: vec![Stage::Line(LineFilter {
+                        op: LineFilterOp::NotContains,
+                        value: "bip".into(),
+                    })],
+                }),
+            ),
+            (
+                r#"{foo="bar", bar!="baz"} != "bip" !~ ".+bop""#,
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![
+                            Matcher {
+                                name: "foo".into(),
+                                op: MatchOp::Eq,
+                                value: "bar".into(),
+                            },
+                            Matcher {
+                                name: "bar".into(),
+                                op: MatchOp::Neq,
+                                value: "baz".into(),
+                            },
+                        ],
+                    },
+                    pipeline: vec![
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::NotContains,
+                            value: "bip".into(),
+                        }),
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Nre,
+                            value: ".+bop".into(),
+                        }),
                     ],
                 }),
             ),
+            (
+                r#"{foo="bar"} |= "baz" |~ "blip" != "flip" !~ "flap""#,
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![Matcher {
+                            name: "foo".into(),
+                            op: MatchOp::Eq,
+                            value: "bar".into(),
+                        }],
+                    },
+                    pipeline: vec![
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Contains,
+                            value: "baz".into(),
+                        }),
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Re,
+                            value: "blip".into(),
+                        }),
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::NotContains,
+                            value: "flip".into(),
+                        }),
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Nre,
+                            value: "flap".into(),
+                        }),
+                    ],
+                }),
+            ),
+            (
+                r#"{foo="bar"} |= "baz" | logfmt !~ "flap""#,
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![Matcher {
+                            name: "foo".into(),
+                            op: MatchOp::Eq,
+                            value: "bar".into(),
+                        }],
+                    },
+                    pipeline: vec![
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Contains,
+                            value: "baz".into(),
+                        }),
+                        Stage::Logfmt,
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Nre,
+                            value: "flap".into(),
+                        }),
+                    ],
+                }),
+            ),
+            (
+                r#"{foo="bar"} |= "baz" | logfmt | level="error""#,
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![Matcher {
+                            name: "foo".into(),
+                            op: MatchOp::Eq,
+                            value: "bar".into(),
+                        }],
+                    },
+                    pipeline: vec![
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Contains,
+                            value: "baz".into(),
+                        }),
+                        Stage::Logfmt,
+                        Stage::LabelFilter(LabelFilter {
+                            label: "level".into(),
+                            op: LabelFilterOp::Eq,
+                            value: LabelValue::String("error".into()),
+                        }),
+                    ],
+                }),
+            ),
+            (
+                r#"{foo="bar"} |= "baz" | logfmt | b>=10GB"#,
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![Matcher {
+                            name: "foo".into(),
+                            op: MatchOp::Eq,
+                            value: "bar".into(),
+                        }],
+                    },
+                    pipeline: vec![
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Contains,
+                            value: "baz".into(),
+                        }),
+                        Stage::Logfmt,
+                        // SI, as Go's `humanize.ParseBytes` reads it: 10 * 1000^3.
+                        Stage::LabelFilter(LabelFilter {
+                            label: "b".into(),
+                            op: LabelFilterOp::Gte,
+                            value: LabelValue::Bytes(10_000_000_000),
+                        }),
+                    ],
+                }),
+            ),
+            (
+                r#"{foo="bar"} | logfmt | status>=500"#,
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![Matcher {
+                            name: "foo".into(),
+                            op: MatchOp::Eq,
+                            value: "bar".into(),
+                        }],
+                    },
+                    pipeline: vec![
+                        Stage::Logfmt,
+                        Stage::LabelFilter(LabelFilter {
+                            label: "status".into(),
+                            op: LabelFilterOp::Gte,
+                            value: LabelValue::Number(500.0),
+                        }),
+                    ],
+                }),
+            ),
+            (
+                r#"{foo="bar"} | logfmt | latency>1h30m"#,
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![Matcher {
+                            name: "foo".into(),
+                            op: MatchOp::Eq,
+                            value: "bar".into(),
+                        }],
+                    },
+                    pipeline: vec![
+                        Stage::Logfmt,
+                        Stage::LabelFilter(LabelFilter {
+                            label: "latency".into(),
+                            op: LabelFilterOp::Gt,
+                            value: LabelValue::Duration(Duration::from_secs(5400)),
+                        }),
+                    ],
+                }),
+            ),
+            /* |> !>
+            (
+                r#"{foo="bar", bar!="baz"} |> "<_>" !> "<_> <_>""#,
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![
+                            Matcher {
+                                name: "foo".into(),
+                                op: MatchOp::Eq,
+                                value: "bar".into(),
+                            },
+                            Matcher {
+                                name: "bar".into(),
+                                op: MatchOp::Neq,
+                                value: "baz".into(),
+                            },
+                        ],
+                    },
+                    pipeline: vec![
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::NotContains,
+                            value: "bip".into(),
+                        }),
+                        Stage::Line(LineFilter {
+                            op: LineFilterOp::Nre,
+                            value: ".+bop".into(),
+                        }),
+                    ],
+                }),
+            ),
+            */
         ];
         for (input, want) in cases {
             let got = Parser::parse(input).unwrap_or_else(|e| panic!("input {input:?}: {e}"));

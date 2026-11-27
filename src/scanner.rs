@@ -1,6 +1,8 @@
 use std::fmt;
+use std::time::Duration;
 
 use crate::error::ParseError;
+use crate::units::{parse_bytes, parse_duration};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -9,6 +11,10 @@ pub enum Token {
     OpenBrace,
     CloseBrace,
     Eq,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
     Neq,
     Re,
     Nre,
@@ -22,6 +28,10 @@ pub enum Token {
 
     Identifier(String),
     String(String),
+
+    Number(f64),
+    Duration(Duration),
+    Bytes(u64),
 
     Eol,
 }
@@ -38,6 +48,10 @@ impl fmt::Display for Token {
             Token::CloseBrace => f.write_str("}"),
             Token::Eq => f.write_str("="),
             Token::Neq => f.write_str("!="),
+            Token::Gt => f.write_str(">"),
+            Token::Gte => f.write_str(">="),
+            Token::Lt => f.write_str("<"),
+            Token::Lte => f.write_str("<="),
             Token::Re => f.write_str("=~"),
             Token::Nre => f.write_str("!~"),
             Token::Npa => f.write_str("!>"),
@@ -52,6 +66,14 @@ impl fmt::Display for Token {
             // `{:?}` on a str re-adds the quotes and escapes, which is close
             // enough to LogQL's Go-style string syntax.
             Token::String(value) => write!(f, "{value:?}"),
+
+            Token::Number(value) => write!(f, "{value}"),
+            // `{:?}` on a `Duration` prints Go-ish units (`5400s`, `1.5s`), so a
+            // message quotes something the user could paste back.
+            Token::Duration(value) => write!(f, "{value:?}"),
+            // The unit the user wrote is not kept, so this re-renders in bytes:
+            // exact and still valid LogQL, if not what they typed.
+            Token::Bytes(value) => write!(f, "{value}B"),
 
             Token::Eol => write!(f, "EOL"),
         }
@@ -83,6 +105,11 @@ impl<'a> Scanner<'a> {
             '=' if self.eat('~') => Ok(Token::Re), // =~ before =
             '=' => Ok(Token::Eq),
 
+            '>' if self.eat('=') => Ok(Token::Gte),
+            '>' => Ok(Token::Gt),
+            '<' if self.eat('=') => Ok(Token::Lte),
+            '<' => Ok(Token::Lt),
+
             '!' if self.eat('=') => Ok(Token::Neq),
             '!' if self.eat('~') => Ok(Token::Nre),
             '!' if self.eat('>') => Ok(Token::Npa), // !> negated pattern
@@ -94,6 +121,7 @@ impl<'a> Scanner<'a> {
 
             '"' => self.string(),
             c if c.is_ascii_alphabetic() || c == ':' || c == '_' => self.identifier(c),
+            i if i.is_ascii_digit() => self.number(i),
 
             other => Err(ParseError::UnexpectedChar(other)),
         }
@@ -167,6 +195,65 @@ impl<'a> Scanner<'a> {
         name.push(first);
         name.push_str(rest);
         Ok(Token::Identifier(name))
+    }
+
+    /// The runes a byte size may be spelled with: B kB MB GB TB PB KB KiB MiB
+    /// GiB TiB PiB.
+    ///
+    /// Deliberately NOT E/Z/Y: Loki excludes them because the value may not fit
+    /// u64. Lowercase is excluded too (bar `k` and `i`), matching Loki — so
+    /// `10gb` is not a byte size, and scans as `10` followed by `gb`.
+    fn is_bytes_size_rune(c: char) -> bool {
+        matches!(c, 'B' | 'i' | 'k' | 'K' | 'M' | 'G' | 'T' | 'P')
+    }
+
+    /// The runes a duration may be spelled with: ns, us (or µs), ms, s, m, h,
+    /// d, w, y.
+    fn is_duration_rune(c: char) -> bool {
+        matches!(c, 'n' | 'u' | 'µ' | 'm' | 's' | 'h' | 'd' | 'w' | 'y')
+    }
+
+    /// Digits and the unit runes, i.e. everything one numeric token can contain.
+    ///
+    /// A single run of these covers `1h30m` as well as `3GiB`, so the token's
+    /// extent is found before anything tries to interpret it.
+    fn is_number_cont(c: char) -> bool {
+        c.is_ascii_digit()
+            || c == '.'
+            || Scanner::is_duration_rune(c)
+            || Scanner::is_bytes_size_rune(c)
+    }
+
+    /// Scans a number with an optional unit: `10`, `1.5`, `1h30m`, `3GiB`.
+    ///
+    /// Duration before bytes, as Loki's lexer does — which is why `10m` is ten
+    /// minutes rather than ten megabytes. A bare number stays a number: Loki's
+    /// `tryScanBytes` needs at least one unit rune, whereas `ByteSize` would
+    /// happily read `500` as 500 bytes.
+    pub fn number(&mut self, first: char) -> Result<Token, ParseError> {
+        let end = self
+            .source
+            .find(|c: char| !Scanner::is_number_cont(c))
+            .unwrap_or(self.source.len()); // all remaining chars are valid
+        let (rest, tail) = self.source.split_at(end);
+        self.source = tail;
+
+        let mut literal = String::with_capacity(1 + rest.len());
+        literal.push(first);
+        literal.push_str(rest);
+
+        if literal.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return literal
+                .parse()
+                .map(Token::Number)
+                .map_err(|_| ParseError::Unsupported);
+        }
+        if let Some(duration) = parse_duration(&literal) {
+            return Ok(Token::Duration(duration));
+        }
+        parse_bytes(&literal)
+            .map(Token::Bytes)
+            .ok_or(ParseError::Unsupported)
     }
 }
 
@@ -279,9 +366,75 @@ mod tests {
         }
     }
 
+    /// The scanner resolves units itself, so the parser never sees `"10"` plus a
+    /// suffix — it gets a value it can put straight into a `LabelValue`.
+    #[test]
+    fn scans_numbers_durations_and_byte_sizes() {
+        let cases = [
+            // No unit: a plain number, even though `ByteSize` would read `500`
+            // as 500 bytes.
+            ("500", Token::Number(500.0)),
+            ("0.5", Token::Number(0.5)),
+            ("2h", Token::Duration(Duration::from_secs(2 * 60 * 60))),
+            // One token, not `1h` followed by `30m`.
+            ("1h30m", Token::Duration(Duration::from_secs(90 * 60))),
+            ("1.5s", Token::Duration(Duration::from_millis(1_500))),
+            ("500ms", Token::Duration(Duration::from_millis(500))),
+            ("500us", Token::Duration(Duration::from_micros(500))),
+            ("500µs", Token::Duration(Duration::from_micros(500))),
+            // Prometheus' units, which Go's own parser does not take.
+            ("7d", Token::Duration(Duration::from_secs(7 * 24 * 60 * 60))),
+            (
+                "1y",
+                Token::Duration(Duration::from_secs(365 * 24 * 60 * 60)),
+            ),
+            // `ByteSize` reads a lone `m` as megabytes, so trying duration first
+            // is what makes this ten minutes.
+            ("10m", Token::Duration(Duration::from_secs(10 * 60))),
+            // SI vs. binary, as `humanize.ParseBytes` separates them.
+            ("10GB", Token::Bytes(10_000_000_000)),
+            ("3GiB", Token::Bytes(3 * 1024 * 1024 * 1024)),
+            // Truncates to 0 — the edge case `bytesize` was chosen for.
+            ("0.5B", Token::Bytes(0)),
+            // `M` is a byte rune but not a duration one, so case alone decides.
+            ("1M", Token::Bytes(1_000_000)),
+        ];
+        for (input, want) in cases {
+            let got = Scanner::new(input)
+                .next_token()
+                .unwrap_or_else(|e| panic!("input {input:?}: {e}"));
+            assert_eq!(got, want, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_numbers_it_cannot_resolve() {
+        // A unit that is neither a duration nor a byte size, a magnitude that is
+        // not a number at all, and a trailing magnitude with no unit of its own.
+        for input in ["10KiBs", "1.2.3", "5ns7"] {
+            let got = Scanner::new(input).next_token();
+            assert!(
+                matches!(got, Err(ParseError::Unsupported)),
+                "input {input:?}: got {got:?}"
+            );
+        }
+    }
+
+    /// `1e3KB` is an error in Loki rather than 1000000 — see the `bytesize` note
+    /// in `Cargo.toml`. `e` is in neither unit class, so the numeric token ends
+    /// at `1` and the rest scans as an identifier, which no production accepts.
+    #[test]
+    fn an_exponent_does_not_scan_as_a_byte_size() {
+        let got = scan_all("1e3KB").expect("should scan");
+        assert_eq!(
+            got,
+            vec![Token::Number(1.0), Token::Identifier("e3KB".into())]
+        );
+    }
+
     #[test]
     fn skips_whitespace_between_tokens() {
-        // LogQL is whitespace-insensitive between tokens. See TODO(human) in next_token.
+        // LogQL is whitespace-insensitive between tokens; `skip_trivia` handles it.
         let got = scan_all("{ } , ( )").expect("should scan");
         assert_eq!(
             got,

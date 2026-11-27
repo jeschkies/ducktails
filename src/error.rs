@@ -6,6 +6,7 @@ pub enum ParseError {
     UnexpectedChar(char),
     UnexpectedToken(Token, Token),
     UnexpectedEOL,
+    Unsupported,
 }
 
 impl fmt::Display for ParseError {
@@ -16,6 +17,7 @@ impl fmt::Display for ParseError {
                 write!(f, "Unexpected token: '{actual}', expected: {expected}")
             }
             ParseError::UnexpectedEOL => write!(f, "Unexpected end of line"),
+            ParseError::Unsupported => write!(f, "Unsupported"),
         }
     }
 }

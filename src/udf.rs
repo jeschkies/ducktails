@@ -1,0 +1,574 @@
+//! Scalar UDFs backing LogQL's parser stages.
+//!
+//! Each one maps `line: Utf8View` → `labels: List<Struct<key, value>>`, so a `|
+//! logfmt` or `| json` stage becomes a `Projection` that replaces the `labels`
+//! column (DESIGN.md §3).
+
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use datafusion::arrow::array::{
+    Array, ArrayRef, AsArray, ByteView, Int64Builder, ListBuilder, MAX_INLINE_VIEW_LEN,
+    StringViewBuilder, StructBuilder, UInt32Builder, UInt64Builder,
+};
+use datafusion::arrow::compute::take;
+use datafusion::arrow::datatypes::DataType;
+use datafusion::common::ScalarValue;
+use datafusion::error::{DataFusionError, Result};
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+};
+
+use crate::table::{label_fields, labels_type};
+use crate::units::{parse_bytes, parse_duration};
+
+/// `logfmt_parse(line) -> List<Struct<key, value>>`.
+///
+/// Implements bare `| logfmt` only: every key/value pair, no flags. Loki also
+/// accepts `--strict`, `--keep-empty` and label expressions — see §5's
+/// "Unsupported productions must say so".
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct LogfmtParse {
+    signature: Signature,
+}
+
+impl LogfmtParse {
+    pub fn new() -> Self {
+        Self {
+            // Immutable: same line always yields the same labels, which lets the
+            // optimizer treat calls as interchangeable and hoist constant ones.
+            // `Utf8View` because that is what the `line` column is. Declaring
+            // `Utf8` would still *work* — DataFusion would insert a cast — but
+            // the cast copies every line, which is the copy the view avoids.
+            signature: Signature::exact(vec![DataType::Utf8View], Volatility::Immutable),
+        }
+    }
+}
+
+impl Default for LogfmtParse {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Wraps the impl so `plan.rs` can write `logfmt_parse().call(vec![col("line")])`.
+pub fn logfmt_parse() -> ScalarUDF {
+    ScalarUDF::from(LogfmtParse::new())
+}
+
+impl ScalarUDFImpl for LogfmtParse {
+    fn name(&self) -> &str {
+        "logfmt_parse"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _args: &[DataType]) -> Result<DataType> {
+        Ok(labels_type())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        // `to_array` normalises the Scalar case, so the loop below handles both a
+        // column and a literal without branching.
+        let lines = args.args[0].to_array(args.number_rows)?;
+        let lines = lines.as_string_view();
+        let buffers = lines.data_buffers();
+
+        let mut labels =
+            ListBuilder::new(StructBuilder::from_fields(label_fields(), args.number_rows));
+
+        // Registered in input order on fresh builders, so a view's buffer index
+        // is also its block index — nothing to map. The clone is a refcount bump
+        // on a buffer the `line` column holds anyway.
+        for field in 0..2 {
+            let builder = labels
+                .values()
+                .field_builder::<StringViewBuilder>(field)
+                .expect("label fields are Utf8View");
+            for buffer in buffers {
+                builder.append_block(buffer.clone());
+            }
+        }
+
+        for i in 0..lines.len() {
+            if lines.is_null(i) {
+                labels.append_null();
+                continue;
+            }
+
+            let line = lines.value(i);
+            // Locates row `i`'s bytes, for the substrings too long to inline.
+            let line_view = ByteView::from(lines.views()[i]);
+
+            let entries = labels.values();
+            for (key, value) in parse_logfmt(line) {
+                append_label(
+                    entries
+                        .field_builder::<StringViewBuilder>(0)
+                        .expect("field 0 is Utf8View"),
+                    &line_view,
+                    line,
+                    Cow::Borrowed(key),
+                )?;
+                append_label(
+                    entries
+                        .field_builder::<StringViewBuilder>(1)
+                        .expect("field 1 is Utf8View"),
+                    &line_view,
+                    line,
+                    value,
+                )?;
+                // A `StructBuilder` tracks its own length separately from its
+                // children, so every row must be appended explicitly.
+                entries.append(true);
+            }
+            labels.append(true);
+        }
+
+        Ok(ColumnarValue::Array(Arc::new(labels.finish()) as ArrayRef))
+    }
+}
+
+/// Appends one key or value, pointing into the line's own bytes where it can.
+///
+/// Three cases, cheapest first. At most `MAX_INLINE_VIEW_LEN` bytes are held
+/// *inside* the 16-byte view, so there is nothing to reference and nothing to
+/// copy — which covers nearly every logfmt key. A longer borrowed substring
+/// becomes a view into the block holding the line. An owned one — a quoted value
+/// whose escapes were resolved — has no bytes in that block, so it is copied;
+/// the builder puts those in a block of its own.
+fn append_label(
+    builder: &mut StringViewBuilder,
+    line_view: &ByteView,
+    line: &str,
+    text: Cow<'_, str>,
+) -> Result<()> {
+    match text {
+        Cow::Borrowed(text) if text.len() as u32 > MAX_INLINE_VIEW_LEN => {
+            // `text` outgrows an inline view, so the line it came from does too:
+            // its bytes are in a data buffer, and `line_view` says which one and
+            // where. The subtraction is the substring's offset within the line —
+            // sound because `text` is a slice of `line`, and only ever read as a
+            // number.
+            let offset =
+                line_view.offset + (text.as_ptr() as usize - line.as_ptr() as usize) as u32;
+            builder.try_append_view(line_view.buffer_index, offset, text.len() as u32)?;
+        }
+        _ => builder.append_value(&*text),
+    }
+    Ok(())
+}
+
+/// Splits one logfmt line into its key/value pairs.
+///
+/// An iterator rather than a `Vec`: the pairs borrow from `line` and go straight
+/// into Arrow buffers, so collecting them first would allocate once per row for
+/// no reason — the one allocation this parser used to make.
+///
+/// A pair with no value, or an empty one, is skipped rather than yielded, which
+/// is why the body loops instead of mapping.
+fn parse_logfmt<'a>(line: &'a str) -> impl Iterator<Item = (&'a str, Cow<'a, str>)> + 'a {
+    let mut remainder = line.trim_start();
+    std::iter::from_fn(move || {
+        loop {
+            let (key, value) = next_pair(&mut remainder)?;
+            match value {
+                Some(v) if !v.is_empty() => return Some((key, v)),
+                _ => continue,
+            }
+        }
+    })
+}
+
+fn next_pair<'a>(line: &mut &'a str) -> Option<(&'a str, Option<Cow<'a, str>>)> {
+    if line.is_empty() {
+        return None;
+    }
+
+    *line = line.trim_start();
+
+    let key = next_key(line)?;
+    if !eat(line, '=') {
+        return Some((key, None));
+    };
+    let value = next_value(line);
+
+    Some((key, value))
+}
+
+fn next_key<'a>(line: &mut &'a str) -> Option<&'a str> {
+    let key_end = line.find(|c: char| c == '=' || c.is_whitespace())?;
+    let key = &line[..key_end];
+    *line = &line[key_end..];
+    Some(key)
+}
+
+fn next_value<'a>(line: &mut &'a str) -> Option<Cow<'a, str>> {
+    if eat(line, '"') {
+        quoted_value(line)
+    } else {
+        unquoted_value(line)
+    }
+}
+
+fn quoted_value<'a>(line: &mut &'a str) -> Option<Cow<'a, str>> {
+    let mut escaped = false; // previous char was a backslash
+    let mut saw_escape = false; // this value contains at least one
+
+    for (i, c) in line.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => {
+                escaped = true;
+                saw_escape = true;
+            }
+            '"' => {
+                let (value, rest) = line.split_at(i);
+                *line = &rest[1..]; // consume the closing quote
+                return Some(if saw_escape {
+                    Cow::Owned(unescape(value)?)
+                } else {
+                    Cow::Borrowed(value)
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Unterminated quote: take the rest, as non-strict logfmt does.
+    Some(Cow::Borrowed(std::mem::take(line)))
+}
+
+/// Resolves the escapes Loki's `unquoteBytes` accepts. `None` on an unknown
+/// escape, matching its `(nil, false)` — non-strict logfmt then drops the pair
+/// rather than inventing a value.
+fn unescape(value: &str) -> Option<String> {
+    // The result is never longer than the input, so one allocation suffices.
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        out.push(match chars.next()? {
+            '"' => '"',
+            '\\' => '\\',
+            '/' => '/',
+            '\'' => '\'',
+            'b' => '\u{8}',
+            'f' => '\u{c}',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'u' => {
+                let hex: String = chars.by_ref().take(4).collect();
+                char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?
+            }
+            _ => return None,
+        });
+    }
+
+    Some(out)
+}
+
+fn unquoted_value<'a>(line: &mut &'a str) -> Option<Cow<'a, str>> {
+    let end = line.find(char::is_whitespace).unwrap_or(line.len());
+    let (value, rest) = line.split_at(end);
+    *line = rest;
+    Some(Cow::Borrowed(value))
+}
+
+fn eat(line: &mut &str, c: char) -> bool {
+    if line.starts_with(c) {
+        *line = &line[1..];
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Borrows the pairs as `&str` so the expectations stay readable.
+    ///
+    /// Takes a reference rather than the `Vec` itself: a `Cow::Owned` value's
+    /// `String` lives *in* that `Vec`, so the returned slices borrow from it and
+    /// the caller has to keep it alive.
+    fn as_strs<'a>(pairs: &'a [(&'a str, Cow<'a, str>)]) -> Vec<(&'a str, &'a str)> {
+        pairs.iter().map(|(k, v)| (*k, v.as_ref())).collect()
+    }
+
+    #[test]
+    fn parses_logfmt_lines() {
+        let cases: [(&str, Vec<(&str, &str)>); 5] = [
+            ("", vec![]),
+            (
+                "level=info msg=started",
+                vec![("level", "info"), ("msg", "started")],
+            ),
+            (
+                r#"level=error msg="something went wrong" code=500"#,
+                vec![
+                    ("level", "error"),
+                    ("msg", "something went wrong"),
+                    ("code", "500"),
+                ],
+            ),
+            (
+                "  level=info   msg=ok  ",
+                vec![("level", "info"), ("msg", "ok")],
+            ),
+            (
+                r#"level=info msg="\"ok""#,
+                vec![("level", "info"), ("msg", r#""ok"#)],
+            ),
+        ];
+
+        for (line, want) in cases {
+            let pairs: Vec<_> = parse_logfmt(line).collect();
+            assert_eq!(as_strs(&pairs), want, "line: {line:?}");
+        }
+    }
+
+    /// Cases that reach past the happy path. Non-strict `| logfmt` never fails a
+    /// line: it skips what it cannot read and keeps the rest.
+    #[test]
+    fn parses_malformed_logfmt_lines() {
+        let cases: [(&str, Vec<(&str, &str)>); 8] = [
+            // A key cannot contain whitespace, so `badkey` has no value and is
+            // dropped — it must not swallow the following key.
+            (
+                "level=info badkey msg=ok",
+                vec![("level", "info"), ("msg", "ok")],
+            ),
+            // Only the first `=` separates; the rest belongs to the value. And
+            // the last pair must consume the cursor, or the leftover text gets
+            // re-parsed into a phantom pair.
+            ("msg=hello=world", vec![("msg", "hello=world")]), // An empty value is dropped exactly like a missing one — `parser.go`
+            // has `if !l.keepEmpty && len(val) == 0 { continue }`. That is what
+            // `--keep-empty` changes, and we do not support it.
+            ("a= b=2", vec![("b", "2")]),
+            ("a=1 b", vec![("a", "1")]),
+            ("b a=1", vec![("a", "1")]),
+            // An unterminated quote takes the rest of the line.
+            (r#"msg="unterminated"#, vec![("msg", "unterminated")]),
+            ("   ", vec![]),
+            // Loki's decoder calls `unquoteBytes()`, so `\"` is unescaped rather
+            // than kept literally.
+            (
+                r#"msg="say \"hi\"" code=1"#,
+                vec![("msg", r#"say "hi""#), ("code", "1")],
+            ),
+        ];
+
+        for (line, want) in cases {
+            let pairs: Vec<_> = parse_logfmt(line).collect();
+            assert_eq!(as_strs(&pairs), want, "line: {line:?}");
+        }
+    }
+}
+
+/// `label_value(labels, name) -> Utf8View`.
+///
+/// The value `name` holds in a `labels` column, or NULL when the row carries no
+/// such label. The NULL is the point: a label filter has to tell "absent" from
+/// "present", because Loki treats the two differently — and differently again
+/// depending on the filter's type.
+///
+/// The *last* match wins. A parser stage appends to `labels` rather than
+/// replacing it, and one logfmt line may repeat a key; Loki resolves both by
+/// overwriting, so the newest entry is the live one.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct LabelValue {
+    signature: Signature,
+}
+
+impl LabelValue {
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::exact(vec![labels_type(), DataType::Utf8], Volatility::Immutable),
+        }
+    }
+}
+
+impl Default for LabelValue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn label_value() -> ScalarUDF {
+    ScalarUDF::from(LabelValue::new())
+}
+
+impl ScalarUDFImpl for LabelValue {
+    fn name(&self) -> &str {
+        "label_value"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _args: &[DataType]) -> Result<DataType> {
+        // The `value` field of `labels`, so a looked-up value keeps viewing the
+        // line it was parsed out of.
+        Ok(DataType::Utf8View)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let ColumnarValue::Scalar(ScalarValue::Utf8(Some(name))) = &args.args[1] else {
+            return Err(DataFusionError::NotImplemented(
+                "label_value: the label name must be a string literal".to_string(),
+            ));
+        };
+
+        let labels = args.args[0].to_array(args.number_rows)?;
+        let labels = labels.as_list::<i32>();
+        let entries = labels.values().as_struct();
+        let keys = entries.column(0).as_string_view();
+        // Index into `entries` directly: a sliced list still offsets into the
+        // whole child array.
+        let offsets = labels.value_offsets();
+
+        let mut matches = UInt32Builder::with_capacity(labels.len());
+        for row in 0..labels.len() {
+            if labels.is_null(row) {
+                matches.append_null();
+                continue;
+            }
+
+            let pairs = offsets[row] as usize..offsets[row + 1] as usize;
+            // `rev`, because the last match is the live one — see above.
+            match pairs.rev().find(|&i| keys.value(i) == name.as_str()) {
+                Some(i) => matches.append_value(i as u32),
+                None => matches.append_null(),
+            }
+        }
+
+        // `take` copies views and clones blocks, not bytes, so the result still
+        // points into the line.
+        Ok(ColumnarValue::Array(take(
+            entries.column(1).as_ref(),
+            &matches.finish(),
+            None,
+        )?))
+    }
+}
+
+/// `label_duration(value) -> Int64`, nanoseconds, NULL when `value` is not a
+/// duration.
+///
+/// NULL rather than an error because "present but unparseable" is a case the
+/// filter has to act on, not fail on — see `label_predicate` in `plan.rs`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct LabelDuration {
+    signature: Signature,
+}
+
+impl LabelDuration {
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::exact(vec![DataType::Utf8View], Volatility::Immutable),
+        }
+    }
+}
+
+impl Default for LabelDuration {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn label_duration() -> ScalarUDF {
+    ScalarUDF::from(LabelDuration::new())
+}
+
+impl ScalarUDFImpl for LabelDuration {
+    fn name(&self) -> &str {
+        "label_duration"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _args: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Int64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let values = args.args[0].to_array(args.number_rows)?;
+        let values = values.as_string_view();
+
+        let mut nanos = Int64Builder::with_capacity(values.len());
+        for i in 0..values.len() {
+            let parsed = (!values.is_null(i))
+                .then(|| parse_duration(values.value(i)))
+                .flatten()
+                .and_then(|d| i64::try_from(d.as_nanos()).ok());
+            nanos.append_option(parsed);
+        }
+
+        Ok(ColumnarValue::Array(Arc::new(nanos.finish()) as ArrayRef))
+    }
+}
+
+/// `label_bytes(value) -> UInt64`, NULL when `value` is not a byte size.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct LabelBytes {
+    signature: Signature,
+}
+
+impl LabelBytes {
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::exact(vec![DataType::Utf8View], Volatility::Immutable),
+        }
+    }
+}
+
+impl Default for LabelBytes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn label_bytes() -> ScalarUDF {
+    ScalarUDF::from(LabelBytes::new())
+}
+
+impl ScalarUDFImpl for LabelBytes {
+    fn name(&self) -> &str {
+        "label_bytes"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _args: &[DataType]) -> Result<DataType> {
+        Ok(DataType::UInt64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let values = args.args[0].to_array(args.number_rows)?;
+        let values = values.as_string_view();
+
+        let mut sizes = UInt64Builder::with_capacity(values.len());
+        for i in 0..values.len() {
+            let parsed = (!values.is_null(i))
+                .then(|| parse_bytes(values.value(i)))
+                .flatten();
+            sizes.append_option(parsed);
+        }
+
+        Ok(ColumnarValue::Array(Arc::new(sizes.finish()) as ArrayRef))
+    }
+}
