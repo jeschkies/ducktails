@@ -6,8 +6,10 @@ use std::{fs::read_to_string, path::PathBuf, sync::Arc};
 use datafusion::{
     arrow::{
         array::{
-            ListBuilder, RecordBatch, StringBuilder, StructBuilder, TimestampNanosecondBuilder,
+            ListBuilder, RecordBatch, StringBuilder, StringViewBuilder, StructBuilder,
+            TimestampNanosecondBuilder,
         },
+        buffer::Buffer,
         datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit},
     },
     catalog::{Session, TableProvider},
@@ -46,7 +48,9 @@ pub fn log_schema() -> SchemaRef {
             DataType::Timestamp(TimeUnit::Nanosecond, None),
             false,
         ),
-        Field::new("line", DataType::Utf8, false),
+        // `Utf8View`, so a line is a 16-byte view into the file's own bytes
+        // rather than a copy of them — see `read_source`.
+        Field::new("line", DataType::Utf8View, false),
         Field::new("labels", labels_type(), true),
         Field::new("filename", DataType::Utf8, false),
     ]);
@@ -59,16 +63,43 @@ pub fn read_source(path: &str) -> Result<RecordBatch> {
     let schema = log_schema();
 
     let mut ts_builder = TimestampNanosecondBuilder::new();
-    let mut line_builder = StringBuilder::new();
+    let mut line_builder = StringViewBuilder::new();
     let mut labels_builder = ListBuilder::new(StructBuilder::from_fields(label_fields(), 0));
     let mut filename_builder = StringBuilder::new();
 
     let ingested_at = Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let contents = read_to_string(path)
         .map_err(|e| DataFusionError::from(e).context(format!("reading {path}")))?;
-    for (i, line) in contents.lines().enumerate() {
-        ts_builder.append_value(ingested_at + i as i64); // TODO: infer ts 
-        line_builder.append_value(line);
+
+    // A view's offset and length are `u32`, so one block cannot exceed 4 GiB.
+    // Checked rather than left to `append_block`'s assert, which would abort the
+    // process instead of failing the query.
+    if contents.len() >= u32::MAX as usize {
+        return Err(DataFusionError::Execution(format!(
+            "{path} is {} bytes: a single file must stay under 4 GiB",
+            contents.len()
+        )));
+    }
+
+    // Locate the lines first: `Buffer::from_vec` takes ownership of the bytes, so
+    // this is the last chance to look at them as a `str`. Subtracting the
+    // pointers is sound because every line is a slice of this one allocation.
+    let lines: Vec<(u32, u32)> = contents
+        .lines()
+        .map(|line| {
+            let offset = line.as_ptr() as usize - contents.as_ptr() as usize;
+            (offset as u32, line.len() as u32)
+        })
+        .collect();
+
+    // The file's bytes become the single block every `line` view points into, so
+    // the contents live in memory once rather than once per line. The block index
+    // comes back from `append_block` — it is not necessarily 0.
+    let block = line_builder.append_block(Buffer::from_vec(contents.into_bytes()));
+
+    for (i, (offset, len)) in lines.iter().enumerate() {
+        ts_builder.append_value(ingested_at + i as i64); // TODO: infer ts
+        line_builder.try_append_view(block, *offset, *len)?;
         labels_builder.append_null();
         filename_builder.append_value(path); // TODO: can save memory here
     }

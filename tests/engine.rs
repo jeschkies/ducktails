@@ -108,7 +108,7 @@ async fn every_line_filter_operator() -> Result<()> {
         let got: Vec<String> = batches
             .iter()
             .flat_map(|b| {
-                let column = b.column(0).as_string::<i32>();
+                let column = b.column(0).as_string_view();
                 (0..b.num_rows())
                     .map(|i| column.value(i).to_string())
                     .collect::<Vec<_>>()
@@ -170,6 +170,30 @@ async fn a_line_filter_after_logfmt_still_reads_the_line() -> Result<()> {
             "+---------------------------------------+",
         ],
         &lines(&pattern, r#"{} | logfmt |= "code=500""#).await?
+    );
+    Ok(())
+}
+
+/// `line` is `Utf8View`, and every stage must read it as one.
+///
+/// A UDF or predicate declaring `Utf8` would still *plan*: DataFusion inserts a
+/// cast, which copies every line and silently undoes the view. Nothing else in
+/// this suite would notice, so the plan itself is the assertion.
+#[tokio::test]
+async fn the_pipeline_reads_the_line_view_without_casting_it() -> Result<()> {
+    let (_dir, pattern) = logfmt_log_file();
+
+    let ast = Parser::parse(r#"{} | logfmt |= "code=500""#).expect("test query must parse");
+    let optimized = SessionContext::new()
+        .execute_logical_plan(plan(&pattern, &ast)?)
+        .await?
+        .logical_plan()
+        .display_indent()
+        .to_string();
+
+    assert!(
+        !optimized.contains("CAST"),
+        "a cast copies the line bytes:\n{optimized}"
     );
     Ok(())
 }

@@ -48,7 +48,11 @@ pub enum LabelFilterOp {
     Re,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The right-hand side of a label filter, as the scanner typed it.
+///
+/// No `Eq`, here or in anything holding one: `Number` is an `f64`. The scanner
+/// has already resolved units, so `10GB` arrives as `Bytes(10_000_000_000)`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum LabelValue {
     String(String), // matcher            = != =~ !~
     Number(f64),    // numberFilter       = != == > >= < <=
@@ -56,7 +60,7 @@ pub enum LabelValue {
     Bytes(u64),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LabelFilter {
     pub label: String,
     pub op: LabelFilterOp,
@@ -80,21 +84,21 @@ pub struct LineFilter {
 }
 
 /// One stage of a log pipeline. §3 models a pipeline as an ordered sequence.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Stage {
     LabelFilter(LabelFilter),
     Line(LineFilter),
     Logfmt,
 } // Json / LabelFilter later
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LogQuery {
     pub selector: Selector,
     pub pipeline: Vec<Stage>,
 }
 
 /// The root of a LogQL query.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// A log query: a selector, later plus a pipeline.
     Log(LogQuery),
@@ -254,11 +258,14 @@ impl<'a> Parser<'a> {
         };
         self.scanner.next_token()?; // committed now
         let value = match self.scanner.next_token()? {
-            Token::String(v) => v,
+            Token::String(v) => LabelValue::String(v),
+            Token::Number(v) => LabelValue::Number(v),
+            Token::Duration(v) => LabelValue::Duration(v),
+            Token::Bytes(v) => LabelValue::Bytes(v),
             other => {
                 return Err(ParseError::UnexpectedToken(
                     other,
-                    Token::String("string".into()),
+                    Token::String("value".into()),
                 ));
             }
         };
@@ -459,13 +466,13 @@ mod tests {
                         Stage::LabelFilter(LabelFilter {
                             label: "level".into(),
                             op: LabelFilterOp::Eq,
-                            value: "error".into(),
+                            value: LabelValue::String("error".into()),
                         }),
                     ],
                 }),
             ),
             (
-                r#"{foo="bar"} |= "baz" | logfmt | b>=10GB`"#,
+                r#"{foo="bar"} |= "baz" | logfmt | b>=10GB"#,
                 Expr::Log(LogQuery {
                     selector: Selector {
                         matchers: vec![Matcher {
@@ -480,10 +487,51 @@ mod tests {
                             value: "baz".into(),
                         }),
                         Stage::Logfmt,
+                        // SI, as Go's `humanize.ParseBytes` reads it: 10 * 1000^3.
                         Stage::LabelFilter(LabelFilter {
-                            label: "level".into(),
-                            op: LabelFilterOp::Eq,
-                            value: "error".into(),
+                            label: "b".into(),
+                            op: LabelFilterOp::Gte,
+                            value: LabelValue::Bytes(10_000_000_000),
+                        }),
+                    ],
+                }),
+            ),
+            (
+                r#"{foo="bar"} | logfmt | status>=500"#,
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![Matcher {
+                            name: "foo".into(),
+                            op: MatchOp::Eq,
+                            value: "bar".into(),
+                        }],
+                    },
+                    pipeline: vec![
+                        Stage::Logfmt,
+                        Stage::LabelFilter(LabelFilter {
+                            label: "status".into(),
+                            op: LabelFilterOp::Gte,
+                            value: LabelValue::Number(500.0),
+                        }),
+                    ],
+                }),
+            ),
+            (
+                r#"{foo="bar"} | logfmt | latency>1h30m"#,
+                Expr::Log(LogQuery {
+                    selector: Selector {
+                        matchers: vec![Matcher {
+                            name: "foo".into(),
+                            op: MatchOp::Eq,
+                            value: "bar".into(),
+                        }],
+                    },
+                    pipeline: vec![
+                        Stage::Logfmt,
+                        Stage::LabelFilter(LabelFilter {
+                            label: "latency".into(),
+                            op: LabelFilterOp::Gt,
+                            value: LabelValue::Duration(Duration::from_secs(5400)),
                         }),
                     ],
                 }),

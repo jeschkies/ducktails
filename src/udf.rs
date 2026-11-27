@@ -1,6 +1,6 @@
 //! Scalar UDFs backing LogQL's parser stages.
 //!
-//! Each one maps `line: Utf8` → `labels: List<Struct<key, value>>`, so a `|
+//! Each one maps `line: Utf8View` → `labels: List<Struct<key, value>>`, so a `|
 //! logfmt` or `| json` stage becomes a `Projection` that replaces the `labels`
 //! column (DESIGN.md §3).
 
@@ -33,7 +33,10 @@ impl LogfmtParse {
         Self {
             // Immutable: same line always yields the same labels, which lets the
             // optimizer treat calls as interchangeable and hoist constant ones.
-            signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+            // `Utf8View` because that is what the `line` column is. Declaring
+            // `Utf8` would still *work* — DataFusion would insert a cast — but
+            // the cast copies every line, which is the copy the view avoids.
+            signature: Signature::exact(vec![DataType::Utf8View], Volatility::Immutable),
         }
     }
 }
@@ -66,7 +69,7 @@ impl ScalarUDFImpl for LogfmtParse {
         // `to_array` normalises the Scalar case, so the loop below handles both a
         // column and a literal without branching.
         let lines = args.args[0].to_array(args.number_rows)?;
-        let lines = lines.as_string::<i32>();
+        let lines = lines.as_string_view();
 
         let mut labels =
             ListBuilder::new(StructBuilder::from_fields(label_fields(), args.number_rows));
