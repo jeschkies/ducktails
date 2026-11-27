@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{logfmt_log_file, long_logfmt_log_file, two_log_files};
+use common::{logfmt_log_file, long_logfmt_log_file, two_log_files, typed_logfmt_log_file};
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::{assert_batches_eq, error::Result, logical_expr::col, prelude::SessionContext};
 use ducktails::{parser::Parser, plan::plan};
@@ -31,6 +31,20 @@ async fn run(
 /// Runs `query` over `pattern` and returns the `line` column in file order.
 async fn lines(pattern: &str, query: &str) -> Result<Vec<datafusion::arrow::array::RecordBatch>> {
     run(pattern, query, &["line"]).await
+}
+
+/// The first column of `batches` as plain strings, for expectations that read
+/// better as a list than as a table.
+fn to_strings(batches: &[datafusion::arrow::array::RecordBatch]) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            let column = b.column(0).as_string_view();
+            (0..b.num_rows())
+                .map(|i| column.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -104,16 +118,7 @@ async fn every_line_filter_operator() -> Result<()> {
     ];
 
     for (query, want) in cases {
-        let batches = lines(&pattern, query).await?;
-        let got: Vec<String> = batches
-            .iter()
-            .flat_map(|b| {
-                let column = b.column(0).as_string_view();
-                (0..b.num_rows())
-                    .map(|i| column.value(i).to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let got = to_strings(&lines(&pattern, query).await?);
         assert_eq!(got, want, "query: {query}");
     }
     Ok(())
@@ -247,6 +252,58 @@ async fn the_pipeline_reads_the_line_view_without_casting_it() -> Result<()> {
         "a cast copies the line bytes:\n{optimized}"
     );
     Ok(())
+}
+
+/// Label filters, and in particular the two cases where Loki is deliberately
+/// asymmetric: a *missing* label reads as `""` for a string filter but drops the
+/// line for a typed one, while an *unparseable* one keeps the line.
+#[tokio::test]
+async fn label_filters_follow_loki_on_missing_and_unparseable_values() -> Result<()> {
+    let (_dir, pattern) = typed_logfmt_log_file();
+
+    const ERROR: &str = "level=error code=500 latency=2h size=11GB";
+    const INFO: &str = "level=info code=200 latency=30m size=1MB";
+    const WARN: &str = "level=warn code=abc";
+    const PLAIN: &str = "not logfmt at all";
+
+    let cases = [
+        (r#"{} | logfmt | level="error""#, vec![ERROR]),
+        // `!=` keeps the line with no `level` at all: absent reads as `""`.
+        (r#"{} | logfmt | level!="error""#, vec![INFO, WARN, PLAIN]),
+        // Fully anchored, so `warn` does not match `warning` and `arn` matches
+        // nothing.
+        (r#"{} | logfmt | level=~"warn|info""#, vec![INFO, WARN]),
+        (r#"{} | logfmt | level=~"arn""#, vec![]),
+        // `code=abc` is present but not a number: Loki keeps the line and flags
+        // it. `PLAIN` has no `code`, so it is dropped.
+        (r#"{} | logfmt | code>=500"#, vec![ERROR, WARN]),
+        (r#"{} | logfmt | code<300"#, vec![INFO, WARN]),
+        // Durations and byte sizes compare in their own units, not as strings:
+        // `30m` < `1h30m` < `2h`, and `1MB` < `10GB` < `11GB`.
+        (r#"{} | logfmt | latency>1h30m"#, vec![ERROR]),
+        (r#"{} | logfmt | latency<=1h30m"#, vec![INFO]),
+        (r#"{} | logfmt | size>=10GB"#, vec![ERROR]),
+        // Stages compose, so a second filter narrows the first.
+        (r#"{} | logfmt | code>=200 | level="info""#, vec![INFO]),
+    ];
+
+    for (query, want) in cases {
+        let got = to_strings(&lines(&pattern, query).await?);
+        assert_eq!(got, want, "query: {query}");
+    }
+    Ok(())
+}
+
+/// The grammar is looser than the semantics: it parses `| level>="error"`, and
+/// the planner is where that has to be refused.
+#[tokio::test]
+async fn a_label_filter_cannot_order_a_string() {
+    let (_dir, pattern) = typed_logfmt_log_file();
+
+    let ast = Parser::parse(r#"{} | logfmt | level>="error""#).expect("should parse");
+    let err = plan(&pattern, &ast).expect_err("ordering a string is not meaningful");
+
+    assert!(err.to_string().contains("level"), "got {err}");
 }
 
 /// A label we cannot resolve yet must be reported, not silently return nothing.

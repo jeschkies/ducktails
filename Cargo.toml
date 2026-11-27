@@ -17,4 +17,11 @@ glob = "0.3.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [dev-dependencies]
+# Chosen over criterion for `AllocProfiler`: it reports allocation counts and
+# bytes next to the timings, which is half of what these benchmarks are for.
+divan = "0.1"
 tempfile = "3"
+
+[[bench]]
+name = "query"
+harness = false

@@ -7,18 +7,23 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::DataType;
 use datafusion::common::TableReference;
 use datafusion::datasource::provider_as_source;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::functions::expr_fn::contains;
+use datafusion::functions::expr_fn::{coalesce, contains};
 use datafusion::functions_nested::expr_fn::array_concat;
 use datafusion::logical_expr::{
     Expr as DfExpr, LogicalPlan, LogicalPlanBuilder, Operator, binary_expr, col, lit, not,
+    try_cast, when,
 };
 
-use crate::parser::{Expr, LineFilter, LineFilterOp, MatchOp, Matcher, Selector, Stage};
+use crate::parser::{
+    Expr, LabelFilter, LabelFilterOp, LabelValue, LineFilter, LineFilterOp, MatchOp, Matcher,
+    Selector, Stage,
+};
 use crate::table::LogTable;
-use crate::udf::logfmt_parse;
+use crate::udf::{label_bytes, label_duration, label_value, logfmt_parse};
 
 /// The column holding the raw log line — what line filters apply to.
 const LINE: &str = "line";
@@ -52,14 +57,7 @@ pub fn plan(source: &str, query: &Expr) -> Result<LogicalPlan> {
     // `| json` will read the output of the filters above it.
     for stage in &log_query.pipeline {
         builder = match stage {
-            // Needs `label_value(labels, name)` (§7) plus the numeric, duration
-            // and bytes comparisons the grammar allows — see §5.
-            Stage::LabelFilter(filter) => {
-                return Err(DataFusionError::NotImplemented(format!(
-                    "label filter on {:?}: label filters are not planned yet",
-                    filter.label
-                )));
-            }
+            Stage::LabelFilter(filter) => builder.filter(label_predicate(filter)?)?,
             Stage::Line(filter) => builder.filter(line_predicate(filter))?,
             // A parser stage is a `Projection`, not a `Filter`: it rewrites
             // `labels` and leaves the row count alone.
@@ -78,6 +76,93 @@ pub fn plan(source: &str, query: &Expr) -> Result<LogicalPlan> {
     }
 
     builder.build()
+}
+
+/// A label filter reads `labels`, so every variant starts from `label_value`.
+///
+/// Loki's semantics here are not uniform, and the difference is deliberate:
+///
+/// - a **string** filter reads a missing label as `""`, so `| level!="error"`
+///   keeps a line that has no `level` at all;
+/// - a **numeric, duration or bytes** filter drops a line whose label is
+///   missing, but *keeps* one whose label is present and unparseable, tagging it
+///   `__error__="LabelFilterErr"` so the user sees the bad data rather than
+///   silently losing the line. We have no `__error__` label, so such a line is
+///   kept unflagged: the rows match Loki, the explanation does not.
+fn label_predicate(filter: &LabelFilter) -> Result<DfExpr> {
+    let value = label_value().call(vec![col(LABELS), lit(filter.label.clone())]);
+
+    match &filter.value {
+        LabelValue::String(text) => string_label_predicate(value, filter, text),
+        LabelValue::Number(number) => {
+            let parsed = try_cast(value.clone(), DataType::Float64);
+            numeric_label_predicate(value, parsed, filter, lit(*number))
+        }
+        LabelValue::Duration(duration) => {
+            let nanos = i64::try_from(duration.as_nanos()).map_err(|_| {
+                DataFusionError::Plan(format!(
+                    "label filter on {:?}: {duration:?} is too long to compare",
+                    filter.label
+                ))
+            })?;
+            let parsed = label_duration().call(vec![value.clone()]);
+            numeric_label_predicate(value, parsed, filter, lit(nanos))
+        }
+        LabelValue::Bytes(bytes) => {
+            let parsed = label_bytes().call(vec![value.clone()]);
+            numeric_label_predicate(value, parsed, filter, lit(*bytes))
+        }
+    }
+}
+
+fn string_label_predicate(value: DfExpr, filter: &LabelFilter, text: &str) -> Result<DfExpr> {
+    // A missing label compares as the empty string, which is what makes `!=`
+    // keep a line that lacks the label entirely.
+    let value = coalesce(vec![value, lit("")]);
+
+    Ok(match filter.op {
+        LabelFilterOp::Eq => value.eq(lit(text)),
+        LabelFilterOp::Neq => value.not_eq(lit(text)),
+        // Fully anchored, like a selector matcher and unlike a line filter.
+        LabelFilterOp::Re => binary_expr(value, Operator::RegexMatch, lit(format!("^(?:{text})$"))),
+        LabelFilterOp::Nre => {
+            binary_expr(value, Operator::RegexNotMatch, lit(format!("^(?:{text})$")))
+        }
+        op => {
+            return Err(DataFusionError::Plan(format!(
+                "label filter on {:?}: {op:?} needs a number, duration or byte size, not a string",
+                filter.label
+            )));
+        }
+    })
+}
+
+/// The three-way outcome a numeric, duration or bytes filter has: `value` tells
+/// absent from present, `parsed` tells parsed from unparseable.
+fn numeric_label_predicate(
+    value: DfExpr,
+    parsed: DfExpr,
+    filter: &LabelFilter,
+    literal: DfExpr,
+) -> Result<DfExpr> {
+    let op = match filter.op {
+        LabelFilterOp::Eq => Operator::Eq,
+        LabelFilterOp::Neq => Operator::NotEq,
+        LabelFilterOp::Gt => Operator::Gt,
+        LabelFilterOp::Gte => Operator::GtEq,
+        LabelFilterOp::Lt => Operator::Lt,
+        LabelFilterOp::Lte => Operator::LtEq,
+        op => {
+            return Err(DataFusionError::Plan(format!(
+                "label filter on {:?}: {op:?} needs a string on the right",
+                filter.label
+            )));
+        }
+    };
+
+    when(value.is_null(), lit(false))
+        .when(parsed.clone().is_null(), lit(true))
+        .otherwise(binary_expr(parsed, op, literal))
 }
 
 /// ANDs the matchers together, as Loki does. `None` for `{}`, which selects

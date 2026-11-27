@@ -8,16 +8,19 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, ByteView, ListBuilder, MAX_INLINE_VIEW_LEN, StringViewBuilder,
-    StructBuilder,
+    Array, ArrayRef, AsArray, ByteView, Int64Builder, ListBuilder, MAX_INLINE_VIEW_LEN,
+    StringViewBuilder, StructBuilder, UInt32Builder, UInt64Builder,
 };
+use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::DataType;
-use datafusion::error::Result;
+use datafusion::common::ScalarValue;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 
 use crate::table::{label_fields, labels_type};
+use crate::units::{parse_bytes, parse_duration};
 
 /// `logfmt_parse(line) -> List<Struct<key, value>>`.
 ///
@@ -160,18 +163,23 @@ fn append_label(
 
 /// Splits one logfmt line into its key/value pairs.
 ///
-/// Borrowed from `line` rather than allocating: the caller copies into Arrow
-/// buffers immediately, so no owned `String`s are needed.
-fn parse_logfmt<'a>(line: &'a str) -> Vec<(&'a str, Cow<'a, str>)> {
-    let mut labels = Vec::new();
+/// An iterator rather than a `Vec`: the pairs borrow from `line` and go straight
+/// into Arrow buffers, so collecting them first would allocate once per row for
+/// no reason — the one allocation this parser used to make.
+///
+/// A pair with no value, or an empty one, is skipped rather than yielded, which
+/// is why the body loops instead of mapping.
+fn parse_logfmt<'a>(line: &'a str) -> impl Iterator<Item = (&'a str, Cow<'a, str>)> + 'a {
     let mut remainder = line.trim_start();
-    while let Some((key, value)) = next_pair(&mut remainder) {
-        match value {
-            Some(v) if !v.is_empty() => labels.push((key, v)),
-            _ => continue,
+    std::iter::from_fn(move || {
+        loop {
+            let (key, value) = next_pair(&mut remainder)?;
+            match value {
+                Some(v) if !v.is_empty() => return Some((key, v)),
+                _ => continue,
+            }
         }
-    }
-    labels
+    })
 }
 
 fn next_pair<'a>(line: &mut &'a str) -> Option<(&'a str, Option<Cow<'a, str>>)> {
@@ -323,7 +331,8 @@ mod tests {
         ];
 
         for (line, want) in cases {
-            assert_eq!(as_strs(&parse_logfmt(line)), want, "line: {line:?}");
+            let pairs: Vec<_> = parse_logfmt(line).collect();
+            assert_eq!(as_strs(&pairs), want, "line: {line:?}");
         }
     }
 
@@ -359,7 +368,207 @@ mod tests {
         ];
 
         for (line, want) in cases {
-            assert_eq!(as_strs(&parse_logfmt(line)), want, "line: {line:?}");
+            let pairs: Vec<_> = parse_logfmt(line).collect();
+            assert_eq!(as_strs(&pairs), want, "line: {line:?}");
         }
+    }
+}
+
+/// `label_value(labels, name) -> Utf8View`.
+///
+/// The value `name` holds in a `labels` column, or NULL when the row carries no
+/// such label. The NULL is the point: a label filter has to tell "absent" from
+/// "present", because Loki treats the two differently — and differently again
+/// depending on the filter's type.
+///
+/// The *last* match wins. A parser stage appends to `labels` rather than
+/// replacing it, and one logfmt line may repeat a key; Loki resolves both by
+/// overwriting, so the newest entry is the live one.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct LabelValue {
+    signature: Signature,
+}
+
+impl LabelValue {
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::exact(vec![labels_type(), DataType::Utf8], Volatility::Immutable),
+        }
+    }
+}
+
+impl Default for LabelValue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn label_value() -> ScalarUDF {
+    ScalarUDF::from(LabelValue::new())
+}
+
+impl ScalarUDFImpl for LabelValue {
+    fn name(&self) -> &str {
+        "label_value"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _args: &[DataType]) -> Result<DataType> {
+        // The `value` field of `labels`, so a looked-up value keeps viewing the
+        // line it was parsed out of.
+        Ok(DataType::Utf8View)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let ColumnarValue::Scalar(ScalarValue::Utf8(Some(name))) = &args.args[1] else {
+            return Err(DataFusionError::NotImplemented(
+                "label_value: the label name must be a string literal".to_string(),
+            ));
+        };
+
+        let labels = args.args[0].to_array(args.number_rows)?;
+        let labels = labels.as_list::<i32>();
+        let entries = labels.values().as_struct();
+        let keys = entries.column(0).as_string_view();
+        // Index into `entries` directly: a sliced list still offsets into the
+        // whole child array.
+        let offsets = labels.value_offsets();
+
+        let mut matches = UInt32Builder::with_capacity(labels.len());
+        for row in 0..labels.len() {
+            if labels.is_null(row) {
+                matches.append_null();
+                continue;
+            }
+
+            let pairs = offsets[row] as usize..offsets[row + 1] as usize;
+            // `rev`, because the last match is the live one — see above.
+            match pairs.rev().find(|&i| keys.value(i) == name.as_str()) {
+                Some(i) => matches.append_value(i as u32),
+                None => matches.append_null(),
+            }
+        }
+
+        // `take` copies views and clones blocks, not bytes, so the result still
+        // points into the line.
+        Ok(ColumnarValue::Array(take(
+            entries.column(1).as_ref(),
+            &matches.finish(),
+            None,
+        )?))
+    }
+}
+
+/// `label_duration(value) -> Int64`, nanoseconds, NULL when `value` is not a
+/// duration.
+///
+/// NULL rather than an error because "present but unparseable" is a case the
+/// filter has to act on, not fail on — see `label_predicate` in `plan.rs`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct LabelDuration {
+    signature: Signature,
+}
+
+impl LabelDuration {
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::exact(vec![DataType::Utf8View], Volatility::Immutable),
+        }
+    }
+}
+
+impl Default for LabelDuration {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn label_duration() -> ScalarUDF {
+    ScalarUDF::from(LabelDuration::new())
+}
+
+impl ScalarUDFImpl for LabelDuration {
+    fn name(&self) -> &str {
+        "label_duration"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _args: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Int64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let values = args.args[0].to_array(args.number_rows)?;
+        let values = values.as_string_view();
+
+        let mut nanos = Int64Builder::with_capacity(values.len());
+        for i in 0..values.len() {
+            let parsed = (!values.is_null(i))
+                .then(|| parse_duration(values.value(i)))
+                .flatten()
+                .and_then(|d| i64::try_from(d.as_nanos()).ok());
+            nanos.append_option(parsed);
+        }
+
+        Ok(ColumnarValue::Array(Arc::new(nanos.finish()) as ArrayRef))
+    }
+}
+
+/// `label_bytes(value) -> UInt64`, NULL when `value` is not a byte size.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct LabelBytes {
+    signature: Signature,
+}
+
+impl LabelBytes {
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::exact(vec![DataType::Utf8View], Volatility::Immutable),
+        }
+    }
+}
+
+impl Default for LabelBytes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn label_bytes() -> ScalarUDF {
+    ScalarUDF::from(LabelBytes::new())
+}
+
+impl ScalarUDFImpl for LabelBytes {
+    fn name(&self) -> &str {
+        "label_bytes"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _args: &[DataType]) -> Result<DataType> {
+        Ok(DataType::UInt64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let values = args.args[0].to_array(args.number_rows)?;
+        let values = values.as_string_view();
+
+        let mut sizes = UInt64Builder::with_capacity(values.len());
+        for i in 0..values.len() {
+            let parsed = (!values.is_null(i))
+                .then(|| parse_bytes(values.value(i)))
+                .flatten();
+            sizes.append_option(parsed);
+        }
+
+        Ok(ColumnarValue::Array(Arc::new(sizes.finish()) as ArrayRef))
     }
 }

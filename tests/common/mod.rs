@@ -75,3 +75,24 @@ pub fn long_logfmt_log_file() -> (TempDir, String) {
     let pattern = dir.path().join("*.log").to_string_lossy().into_owned();
     (dir, pattern)
 }
+
+/// Logfmt lines covering every label value type a filter can compare, plus the
+/// two cases Loki treats specially: a label that is *missing* from a line, and
+/// one that is present but *unparseable* as the type being compared.
+pub fn typed_logfmt_log_file() -> (TempDir, String) {
+    let dir = tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("app.log"),
+        concat!(
+            "level=error code=500 latency=2h size=11GB\n",
+            "level=info code=200 latency=30m size=1MB\n",
+            // `code` cannot be read as a number, and the other labels are absent.
+            "level=warn code=abc\n",
+            // No labels at all.
+            "not logfmt at all\n",
+        ),
+    )
+    .expect("write app.log");
+    let pattern = dir.path().join("*.log").to_string_lossy().into_owned();
+    (dir, pattern)
+}
