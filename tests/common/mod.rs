@@ -56,3 +56,22 @@ pub fn ctx_with(pattern: String) -> Result<SessionContext> {
     ctx.register_table("logs", Arc::new(LogTable::new(pattern)))?;
     Ok(ctx)
 }
+
+/// Logfmt lines whose values are longer than a view can inline, so the labels
+/// they produce take the by-reference path instead of the inline one.
+///
+/// The second line's value has escapes to resolve, so its bytes do not exist
+/// anywhere in the line and cannot be referenced at all.
+pub fn long_logfmt_log_file() -> (TempDir, String) {
+    let dir = tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("app.log"),
+        concat!(
+            "level=info msg=\"a value well past twelve bytes\"\n",
+            "level=warn msg=\"he said \\\"twelve bytes or more\\\" plainly\"\n",
+        ),
+    )
+    .expect("write app.log");
+    let pattern = dir.path().join("*.log").to_string_lossy().into_owned();
+    (dir, pattern)
+}

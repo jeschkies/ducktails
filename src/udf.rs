@@ -8,7 +8,8 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, ListBuilder, StringBuilder, StructBuilder,
+    Array, ArrayRef, AsArray, ByteView, ListBuilder, MAX_INLINE_VIEW_LEN, StringViewBuilder,
+    StructBuilder,
 };
 use datafusion::arrow::datatypes::DataType;
 use datafusion::error::Result;
@@ -70,9 +71,23 @@ impl ScalarUDFImpl for LogfmtParse {
         // column and a literal without branching.
         let lines = args.args[0].to_array(args.number_rows)?;
         let lines = lines.as_string_view();
+        let buffers = lines.data_buffers();
 
         let mut labels =
             ListBuilder::new(StructBuilder::from_fields(label_fields(), args.number_rows));
+
+        // Registered in input order on fresh builders, so a view's buffer index
+        // is also its block index — nothing to map. The clone is a refcount bump
+        // on a buffer the `line` column holds anyway.
+        for field in 0..2 {
+            let builder = labels
+                .values()
+                .field_builder::<StringViewBuilder>(field)
+                .expect("label fields are Utf8View");
+            for buffer in buffers {
+                builder.append_block(buffer.clone());
+            }
+        }
 
         for i in 0..lines.len() {
             if lines.is_null(i) {
@@ -80,16 +95,28 @@ impl ScalarUDFImpl for LogfmtParse {
                 continue;
             }
 
+            let line = lines.value(i);
+            // Locates row `i`'s bytes, for the substrings too long to inline.
+            let line_view = ByteView::from(lines.views()[i]);
+
             let entries = labels.values();
-            for (key, value) in parse_logfmt(lines.value(i)) {
-                entries
-                    .field_builder::<StringBuilder>(0)
-                    .expect("field 0 is Utf8")
-                    .append_value(key);
-                entries
-                    .field_builder::<StringBuilder>(1)
-                    .expect("field 1 is Utf8")
-                    .append_value(value);
+            for (key, value) in parse_logfmt(line) {
+                append_label(
+                    entries
+                        .field_builder::<StringViewBuilder>(0)
+                        .expect("field 0 is Utf8View"),
+                    &line_view,
+                    line,
+                    Cow::Borrowed(key),
+                )?;
+                append_label(
+                    entries
+                        .field_builder::<StringViewBuilder>(1)
+                        .expect("field 1 is Utf8View"),
+                    &line_view,
+                    line,
+                    value,
+                )?;
                 // A `StructBuilder` tracks its own length separately from its
                 // children, so every row must be appended explicitly.
                 entries.append(true);
@@ -99,6 +126,36 @@ impl ScalarUDFImpl for LogfmtParse {
 
         Ok(ColumnarValue::Array(Arc::new(labels.finish()) as ArrayRef))
     }
+}
+
+/// Appends one key or value, pointing into the line's own bytes where it can.
+///
+/// Three cases, cheapest first. At most `MAX_INLINE_VIEW_LEN` bytes are held
+/// *inside* the 16-byte view, so there is nothing to reference and nothing to
+/// copy — which covers nearly every logfmt key. A longer borrowed substring
+/// becomes a view into the block holding the line. An owned one — a quoted value
+/// whose escapes were resolved — has no bytes in that block, so it is copied;
+/// the builder puts those in a block of its own.
+fn append_label(
+    builder: &mut StringViewBuilder,
+    line_view: &ByteView,
+    line: &str,
+    text: Cow<'_, str>,
+) -> Result<()> {
+    match text {
+        Cow::Borrowed(text) if text.len() as u32 > MAX_INLINE_VIEW_LEN => {
+            // `text` outgrows an inline view, so the line it came from does too:
+            // its bytes are in a data buffer, and `line_view` says which one and
+            // where. The subtraction is the substring's offset within the line —
+            // sound because `text` is a slice of `line`, and only ever read as a
+            // number.
+            let offset =
+                line_view.offset + (text.as_ptr() as usize - line.as_ptr() as usize) as u32;
+            builder.try_append_view(line_view.buffer_index, offset, text.len() as u32)?;
+        }
+        _ => builder.append_value(&*text),
+    }
+    Ok(())
 }
 
 /// Splits one logfmt line into its key/value pairs.

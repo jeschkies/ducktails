@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{logfmt_log_file, two_log_files};
+use common::{logfmt_log_file, long_logfmt_log_file, two_log_files};
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::{assert_batches_eq, error::Result, logical_expr::col, prelude::SessionContext};
 use ducktails::{parser::Parser, plan::plan};
@@ -170,6 +170,57 @@ async fn a_line_filter_after_logfmt_still_reads_the_line() -> Result<()> {
             "+---------------------------------------+",
         ],
         &lines(&pattern, r#"{} | logfmt |= "code=500""#).await?
+    );
+    Ok(())
+}
+
+/// A value too long to inline must be a *view into the line*, not a copy of it.
+///
+/// Nothing else in this suite reaches that path: a value of 12 bytes or fewer
+/// lives inside its own 16-byte view, and every fixture above stays under that.
+/// Keys are always short enough to inline, so the `key` column registers the
+/// line block and then never points into it.
+#[tokio::test]
+async fn a_long_label_value_views_the_line_instead_of_copying_it() -> Result<()> {
+    let (dir, pattern) = long_logfmt_log_file();
+    let size = std::fs::metadata(dir.path().join("app.log"))
+        .expect("fixture exists")
+        .len();
+
+    let batches = run(&pattern, "{} | logfmt", &["labels"]).await?;
+    let entries = batches[0].column(0).as_list::<i32>().values().as_struct();
+    let values = entries.column(1).as_string_view();
+
+    assert!(
+        (0..values.len()).any(|i| values.value(i) == "a value well past twelve bytes"),
+        "the long value must survive the round trip"
+    );
+    assert!(
+        values.data_buffers().iter().any(|b| b.len() as u64 == size),
+        "expected a block that is the file itself, got blocks of {:?} for a {size} byte file",
+        values
+            .data_buffers()
+            .iter()
+            .map(|b| b.len())
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+/// An escaped value is the one case that must copy: its unescaped bytes appear
+/// nowhere in the line, so there is nothing to point at.
+#[tokio::test]
+async fn an_escaped_label_value_is_unescaped_and_kept() -> Result<()> {
+    let (_dir, pattern) = long_logfmt_log_file();
+
+    let batches = run(&pattern, "{} | logfmt", &["labels"]).await?;
+    let entries = batches[0].column(0).as_list::<i32>().values().as_struct();
+    let values = entries.column(1).as_string_view();
+
+    let got: Vec<&str> = (0..values.len()).map(|i| values.value(i)).collect();
+    assert!(
+        got.contains(&r#"he said "twelve bytes or more" plainly"#),
+        "got {got:?}"
     );
     Ok(())
 }

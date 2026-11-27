@@ -20,10 +20,12 @@ use datafusion::{
 };
 use datafusion_datasource::memory::MemorySourceConfig;
 
+/// `Utf8View`, so a key or value can *point at* the line it was parsed out of
+/// instead of being copied out of it — see `logfmt_parse`.
 pub fn label_fields() -> Fields {
     Fields::from(vec![
-        Field::new("key", DataType::Utf8, false),
-        Field::new("value", DataType::Utf8, true),
+        Field::new("key", DataType::Utf8View, false),
+        Field::new("value", DataType::Utf8View, true),
     ])
 }
 
