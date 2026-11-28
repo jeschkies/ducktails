@@ -1,0 +1,58 @@
+# A throwaway environment for seeing ducktails through Grafana.
+#
+#   docker compose up --build
+#   open http://localhost:3000/explore
+#
+# Log panels and Explore work. Metric panels answer 501 until a metric query
+# over a range is built — that gap is the point of looking.
+name: ducktails
+
+services:
+  # A line a second, so Explore has something moving to look at. Every tenth is
+  # an error, which gives `|= "error"` and `| logfmt | level="error"` something
+  # to find.
+  loggen:
+    image: busybox:1.37
+    volumes:
+      - logs:/logs
+    command:
+      - sh
+      - -c
+      - |
+        i=0
+        while :; do
+          i=$$((i + 1))
+          if [ $$((i % 10)) -eq 0 ]; then level=error; else level=info; fi
+          printf '%s level=%s msg="request completed" service=api status=200 duration=12ms\n' \
+            "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$level" >> /logs/app.log
+          sleep 1
+        done
+
+  ducktails:
+    build: .
+    # One argument, not a shell glob: there is no shell in the image, and the
+    # engine resolves the glob itself on every query.
+    command: ["serve", "/logs/*.log"]
+    volumes:
+      - logs:/logs:ro
+    ports:
+      - "3100:3100"
+    depends_on:
+      - loggen
+
+  grafana:
+    image: grafana/grafana:13.0.14
+    ports:
+      - "3000:3000"
+    environment:
+      # Throwaway: no login to get in the way.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./compose/grafana:/etc/grafana/provisioning:ro
+    depends_on:
+      - ducktails
+
+volumes:
+  logs:

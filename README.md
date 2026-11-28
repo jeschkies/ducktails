@@ -5,6 +5,19 @@ Like DuckDB but for logs.
 ducktails '/var/log/*.log' '{filename=~".*/app\.log"} |= "error" | logfmt | status>=500'
 ```
 
+## Trying it with Grafana
+
+```
+docker compose up --build
+open http://localhost:3000/explore
+```
+
+A log generator writes a line a second, ducktails serves it on Loki's port, and
+Grafana comes with the datasource provisioned. Explore and log panels work;
+metric panels answer 501 until a metric query over a range is built, and "Save &
+test" reports an error because Grafana's health check sends
+`vector(1)+vector(1)`.
+
 ## Roadmap
 
 ### Fix first
@@ -87,7 +100,9 @@ Operators and literals:
 - [ ] arithmetic: `+`, `-`, `*`, `/`, `%`, `^`
 - [ ] comparison, with and without the `bool` modifier
 - [ ] logical: `and`, `or`, `unless`
-- [ ] `vector(0)`, scalar literals, `label_replace()`
+- [ ] `vector(0)`, scalar literals, `label_replace()`. Grafana's datasource
+      health check sends `vector(1)+vector(1)`, so this is also what makes "Save
+      & test" pass — Explore works without it.
 - [ ] `offset` modifier
 
 ### Engine
@@ -113,9 +128,25 @@ would let it stand in for a querier.
       layer already emits. GET and form POST, since Grafana sends both.
 - [ ] `/query_range` for metric queries, which needs `matrix` and a grid of
       instants, and is what motivates `sum by`/`without`
+- [x] A distroless image (`gcr.io/distroless/cc-debian12`) and a compose
+      environment with Grafana, a log generator and the datasource provisioned
 - [ ] The gRPC querier protocol: `SchedulerForQuerier.QuerierLoop`, typed
       `queryrange.QueryRequest` work, results returned to the frontend address
       it hands over. A static scheduler address avoids needing dskit's ring.
+
+### Instrumentation
+
+Deferred on purpose: the server works without it, and every OTel layer sits on
+top of these two crates anyway.
+
+- [ ] `tracing` and `tracing-subscriber` with `EnvFilter`, replacing the
+      `eprintln!`s. DataFusion instruments with `log` rather than `tracing`, so
+      the bridge is what surfaces planner diagnostics.
+- [ ] Spans around opening a catalog, planning and execution — where a slow
+      query's time actually goes, which a benchmark cannot tell you.
+- [ ] OTLP export and `/metrics`. The `opentelemetry` crates are all 0.x and
+      must move together: a mismatched pair gives two registries and spans that
+      silently go nowhere.
 
 ### Catalogs
 

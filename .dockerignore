@@ -1,0 +1,11 @@
+# The build runs cargo inside the image; the host's artifacts would only bloat
+# the context (and confuse nothing useful).
+target
+.git
+.github
+
+# Not part of the build.
+Dockerfile
+.dockerignore
+compose.yaml
+compose
