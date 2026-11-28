@@ -92,11 +92,30 @@ Operators and literals:
 
 ### Engine
 
-- [x] Range selectors `[5m]` and `--now`, for instant queries
+- [x] Range selectors `[5m]`, and an absolute window: `--from`/`--to`, where
+      `--to` doubles as the instant a metric query is evaluated at. Unset means
+      the whole of the data, not `logcli`'s last hour — a file is not a live
+      store.
+- [x] `limit` and direction, defaulting to Loki's 100 and backward. A log query
+      is ordered by the plan, since "the newest hundred lines" needs it.
 - [ ] Range queries: `--from`/`--to`/`--step` over a grid of instants. Sliding
       windows are the hard part — overlapping windows are not a `GROUP BY`
-- [ ] `limit` and direction (forward/backward)
 - [ ] Step and interval for range queries
+
+### Server mode
+
+`ducktails serve` exists as a subcommand and does nothing yet. The aim is enough
+of Loki's HTTP API to point Grafana at, then Loki's gRPC querier protocol so it
+can stand in for a querier.
+
+- [ ] `/ready`, `/status/buildinfo`, `/labels`, `/label/{name}/values`
+- [ ] `/query` and `/query_range` for log queries — `streams`, which the output
+      layer already emits
+- [ ] `/query_range` for metric queries, which needs `matrix` and a grid of
+      instants, and is what motivates `sum by`/`without`
+- [ ] The gRPC querier protocol: `SchedulerForQuerier.QuerierLoop`, typed
+      `queryrange.QueryRequest` work, results returned to the frontend address
+      it hands over. A static scheduler address avoids needing dskit's ring.
 
 ### Catalogs
 

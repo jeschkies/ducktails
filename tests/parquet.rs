@@ -18,6 +18,7 @@ use datafusion::prelude::SessionContext;
 use ducktails::catalog::Catalog;
 use ducktails::parser::Parser;
 use ducktails::plan::plan;
+use ducktails::query::Query;
 use tempfile::{TempDir, tempdir};
 
 /// 2026-11-27T10:00:00Z, in milliseconds.
@@ -74,12 +75,15 @@ async fn run(url: &str, query: &str, columns: &[&str]) -> Result<Vec<RecordBatch
     let ast = Parser::parse(query).expect("test query must parse");
     let now: DateTime<Utc> = "2026-11-27T10:02:00Z".parse().expect("instant");
 
-    ctx.execute_logical_plan(plan(&catalog, &ast, now)?)
-        .await?
-        .sort_by(vec![datafusion::prelude::col("timestamp")])?
-        .select_columns(columns)?
-        .collect()
-        .await
+    ctx.execute_logical_plan(plan(
+        &catalog,
+        &Query::new(ast).with_window(None, Some(now)),
+    )?)
+    .await?
+    .sort_by(vec![datafusion::prelude::col("timestamp")])?
+    .select_columns(columns)?
+    .collect()
+    .await
 }
 
 /// The whole pipeline over Parquet: the line filter reads the mapped `line`

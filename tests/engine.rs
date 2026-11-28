@@ -11,7 +11,12 @@ use common::{
 };
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::{assert_batches_eq, error::Result, logical_expr::col, prelude::SessionContext};
-use ducktails::{catalog::Catalog, parser::Parser, plan::plan};
+use ducktails::{
+    catalog::Catalog,
+    parser::Parser,
+    plan::plan,
+    query::{Direction, Query},
+};
 
 /// Runs `query` over `pattern` and returns `columns` in file order.
 async fn run(
@@ -20,7 +25,7 @@ async fn run(
     columns: &[&str],
 ) -> Result<Vec<datafusion::arrow::array::RecordBatch>> {
     let ast = Parser::parse(query).expect("test query must parse");
-    let logical_plan = plan(&Catalog::files(pattern), &ast, Utc::now())?;
+    let logical_plan = plan(&Catalog::files(pattern), &Query::new(ast))?;
 
     SessionContext::new()
         .execute_logical_plan(logical_plan)
@@ -244,7 +249,7 @@ async fn the_pipeline_reads_the_line_view_without_casting_it() -> Result<()> {
 
     let ast = Parser::parse(r#"{} | logfmt |= "code=500""#).expect("test query must parse");
     let optimized = SessionContext::new()
-        .execute_logical_plan(plan(&Catalog::files(&pattern), &ast, Utc::now())?)
+        .execute_logical_plan(plan(&Catalog::files(&pattern), &Query::new(ast))?)
         .await?
         .logical_plan()
         .display_indent()
@@ -304,7 +309,7 @@ async fn a_label_filter_cannot_order_a_string() {
     let (_dir, pattern) = typed_logfmt_log_file();
 
     let ast = Parser::parse(r#"{} | logfmt | level>="error""#).expect("should parse");
-    let err = plan(&Catalog::files(&pattern), &ast, Utc::now())
+    let err = plan(&Catalog::files(&pattern), &Query::new(ast))
         .expect_err("ordering a string is not meaningful");
 
     assert!(err.to_string().contains("level"), "got {err}");
@@ -333,7 +338,7 @@ async fn unavailable_label_is_an_error() {
 
     let ast = Parser::parse(r#"{job="app"}"#).expect("should parse");
     let err =
-        plan(&Catalog::files(&pattern), &ast, Utc::now()).expect_err("job is not available yet");
+        plan(&Catalog::files(&pattern), &Query::new(ast)).expect_err("job is not available yet");
 
     let message = err.to_string();
     assert!(message.contains("job"), "got {message}");
@@ -365,7 +370,10 @@ async fn samples(pattern: &str, query: &str) -> Result<Vec<datafusion::arrow::ar
     let now: DateTime<Utc> = NOW.parse().expect("instant must parse");
 
     SessionContext::new()
-        .execute_logical_plan(plan(&Catalog::files(pattern), &ast, now)?)
+        .execute_logical_plan(plan(
+            &Catalog::files(pattern),
+            &Query::new(ast).with_window(None, Some(now)),
+        )?)
         .await?
         .sort_by(vec![col("filename")])?
         .select_columns(&["value"])?
@@ -475,4 +483,91 @@ fn an_unknown_function_is_reported() {
     let err = Parser::parse("coun_over_time({}[5m])").expect_err("should not parse");
 
     assert_eq!(err.to_string(), "Unknown function: coun_over_time");
+}
+
+/// Runs a log query and returns the lines *in the order the plan produced them*
+/// — unlike `lines`, which re-sorts, because here the order is what is on trial.
+async fn ordered_lines(
+    pattern: &str,
+    query: &str,
+    configure: impl FnOnce(Query) -> Query,
+) -> Result<Vec<String>> {
+    let ast = Parser::parse(query).expect("test query must parse");
+    let query = configure(Query::new(ast));
+
+    let batches = SessionContext::new()
+        .execute_logical_plan(plan(&Catalog::files(pattern), &query)?)
+        .await?
+        .select_columns(&["line"])?
+        .collect()
+        .await?;
+
+    Ok(to_strings(&batches))
+}
+
+/// The window is `(start, end]`, so a line exactly on `start` is excluded and one
+/// exactly on `end` is kept.
+#[tokio::test]
+async fn a_window_bounds_a_log_query() -> Result<()> {
+    let (_dir, pattern) = metric_log_files();
+    let at = |t: &str| Some(t.parse::<DateTime<Utc>>().expect("instant"));
+
+    let got = ordered_lines(&pattern, "{}", |query| {
+        query.with_window(at("2026-11-27T10:02:00Z"), at("2026-11-27T10:03:00Z"))
+    })
+    .await?;
+
+    // 10:02 sits on the open start bound and is dropped; 10:03 is kept.
+    assert_eq!(got, vec!["2026-11-27T10:03:00Z level=error msg=d"]);
+    Ok(())
+}
+
+/// A limit means "the newest n", which is only meaningful because the plan
+/// orders the lines itself.
+#[tokio::test]
+async fn a_limit_takes_the_newest_lines() -> Result<()> {
+    let (_dir, pattern) = metric_log_files();
+
+    let got = ordered_lines(&pattern, "{}", |query| query.with_limit(Some(2))).await?;
+
+    assert_eq!(
+        got,
+        vec![
+            "2026-11-27T10:04:00Z level=error msg=c",
+            "2026-11-27T10:03:00Z level=error msg=d",
+        ]
+    );
+    Ok(())
+}
+
+/// Forward reverses that: the oldest lines, oldest first.
+#[tokio::test]
+async fn forward_takes_the_oldest_lines() -> Result<()> {
+    let (_dir, pattern) = metric_log_files();
+
+    let got = ordered_lines(&pattern, "{}", |query| {
+        query.with_limit(Some(2)).with_direction(Direction::Forward)
+    })
+    .await?;
+
+    assert_eq!(
+        got,
+        vec![
+            "2026-11-27T09:00:00Z level=info msg=old",
+            "2026-11-27T10:00:00Z level=info msg=a",
+        ]
+    );
+    Ok(())
+}
+
+/// A metric query has no instant to look back from unless one is given.
+#[tokio::test]
+async fn a_metric_query_needs_an_instant() {
+    let (_dir, pattern) = metric_log_files();
+    let ast = Parser::parse("count_over_time({}[5m])").expect("should parse");
+
+    let err =
+        plan(&Catalog::files(&pattern), &Query::new(ast)).expect_err("no instant to evaluate at");
+
+    assert!(err.to_string().contains("instant"), "got {err}");
 }

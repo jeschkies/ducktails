@@ -8,6 +8,7 @@ pub mod error;
 pub mod output;
 pub mod parser;
 pub mod plan;
+pub mod query;
 pub mod scanner;
 pub mod table;
 pub mod udf;

@@ -24,6 +24,7 @@ use crate::parser::{
     Expr, LabelFilter, LabelFilterOp, LabelValue, LineFilter, LineFilterOp, LogQuery, MatchOp,
     Matcher, RangeAggregation, RangeOp, Selector, Stage,
 };
+use crate::query::{Direction, Query};
 use crate::table::is_label;
 use crate::udf::{label_bytes, label_duration, label_value, logfmt_parse};
 
@@ -43,14 +44,65 @@ const VALUE: &str = "value";
 ///
 /// `source` doubles as the table name, so `EXPLAIN` output names the glob —
 /// the same read as DuckDB's `SELECT * FROM '/var/log/*.log'`.
-/// `now` is the instant a metric query is evaluated at, as Loki's instant query
-/// API takes a `time` parameter. A log query ignores it, until it grows a query
-/// window of its own.
-pub fn plan(catalog: &Catalog, query: &Expr, now: DateTime<Utc>) -> Result<LogicalPlan> {
-    match query {
-        Expr::Log(log_query) => log_builder(catalog, log_query)?.build(),
-        Expr::Metric(aggregation) => plan_range_aggregation(catalog, aggregation, now),
+pub fn plan(catalog: &Catalog, query: &Query) -> Result<LogicalPlan> {
+    match &query.expr {
+        Expr::Log(log_query) => plan_log_query(catalog, log_query, query),
+        Expr::Metric(aggregation) => plan_range_aggregation(catalog, aggregation, query),
     }
+}
+
+/// Plans a log query: the pipeline, bounded by the window, ordered and cut to
+/// the limit.
+///
+/// The order is part of the answer rather than a convenience — "the newest
+/// hundred lines" only means anything once the rows are sorted — so the sort
+/// belongs in the plan rather than in whatever consumes it.
+fn plan_log_query(catalog: &Catalog, log_query: &LogQuery, query: &Query) -> Result<LogicalPlan> {
+    let mut builder = log_builder(catalog, log_query)?;
+
+    if let Some(predicate) = window_predicate(query.start, query.end)? {
+        builder = builder.filter(predicate)?;
+    }
+
+    let order = match query.direction {
+        Direction::Backward => col(TIMESTAMP).sort(false, false),
+        Direction::Forward => col(TIMESTAMP).sort(true, false),
+    };
+    builder = builder.sort(vec![order])?;
+
+    if let Some(limit) = query.limit {
+        builder = builder.limit(0, Some(limit))?;
+    }
+
+    builder.build()
+}
+
+/// `(start, end]` as a predicate, or `None` when the window is unbounded.
+///
+/// Half-open at the start, as Loki's range selectors are, so adjacent windows
+/// neither overlap nor drop a line between them.
+fn window_predicate(
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+) -> Result<Option<DfExpr>> {
+    let bound = |at: DateTime<Utc>| -> Result<DfExpr> {
+        at.timestamp_nanos_opt().map(instant).ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "{at} is outside the range of nanosecond timestamps"
+            ))
+        })
+    };
+
+    Ok(match (start, end) {
+        (None, None) => None,
+        (Some(start), None) => Some(col(TIMESTAMP).gt(bound(start)?)),
+        (None, Some(end)) => Some(col(TIMESTAMP).lt_eq(bound(end)?)),
+        (Some(start), Some(end)) => Some(
+            col(TIMESTAMP)
+                .gt(bound(start)?)
+                .and(col(TIMESTAMP).lt_eq(bound(end)?)),
+        ),
+    })
 }
 
 /// Everything a metric query shares with a log query: the scan, the selector and
@@ -128,8 +180,14 @@ fn instant(nanos: i64) -> DfExpr {
 fn plan_range_aggregation(
     catalog: &Catalog,
     aggregation: &RangeAggregation,
-    now: DateTime<Utc>,
+    query: &Query,
 ) -> Result<LogicalPlan> {
+    // A range selector says how far back to look, so the window needs only the
+    // instant to look back *from* — which is why Loki's instant query takes a
+    // `time` and no range of its own, and why `start` plays no part here.
+    let now = query.end.ok_or_else(|| {
+        DataFusionError::Plan("a metric query needs an instant to evaluate at".to_string())
+    })?;
     let end = now.timestamp_nanos_opt().ok_or_else(|| {
         DataFusionError::Plan(format!(
             "{now} is outside the range of nanosecond timestamps"

@@ -11,13 +11,13 @@
 
 use std::fmt::Write as _;
 
-use chrono::Utc;
 use datafusion::error::Result;
 use datafusion::execution::context::SessionContext;
 use datafusion::prelude::SessionConfig;
 use ducktails::catalog::Catalog;
 use ducktails::parser::Parser;
 use ducktails::plan::plan;
+use ducktails::query::Query;
 use ducktails::table::read_source;
 use tempfile::{TempDir, tempdir};
 
@@ -59,7 +59,7 @@ async fn run(pattern: &str, query: &str) -> Result<usize> {
     let ast = Parser::parse(query).expect("benchmark query must parse");
     let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
     let batches = ctx
-        .execute_logical_plan(plan(&Catalog::files(pattern), &ast, Utc::now())?)
+        .execute_logical_plan(plan(&Catalog::files(pattern), &Query::new(ast))?)
         .await?
         .collect()
         .await?;

@@ -10,14 +10,31 @@ use ducktails::catalog::Catalog;
 use ducktails::output::{Format, ResultKind, write_result};
 use ducktails::parser::{Expr, Parser};
 use ducktails::plan::{plan, plan_newest};
+use ducktails::query::{Direction, Query};
 use ducktails::table::is_label;
 
 /// Like DuckDB but for logs.
 ///
-/// Source first, query second, following `duckdb FILENAME SQL`.
+/// Subcommands rather than DuckDB's bare `FILENAME SQL`, because serving is not
+/// a query — `logcli query` is the closer model, and the point of serving is
+/// Loki compatibility.
 #[derive(ClapParser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Run a LogQL query and print the result
+    Query(QueryArgs),
+    /// Serve a subset of Loki's HTTP API
+    Serve(ServeArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct QueryArgs {
     /// Log file or glob to read; use /dev/stdin for a pipe
     #[arg(value_name = "FILENAME", value_parser = parse_source)]
     source: String,
@@ -26,17 +43,47 @@ struct Cli {
     #[arg(value_name = "LOGQL")]
     query: String,
 
-    /// Instant to evaluate a metric query at, RFC3339
+    /// Start of the query window, exclusive, RFC3339
     ///
-    /// Defaults to the newest line in the data rather than to wall-clock now,
-    /// which is where this parts ways with `logcli instant-query --now`: a file
-    /// can be arbitrarily old, and "now" would then select nothing.
+    /// Unset reads from the beginning of the data, which is what pointing at a
+    /// file usually means — unlike `logcli`, whose `--since=1h` default suits a
+    /// store that holds live data.
     #[arg(long, value_name = "RFC3339")]
-    now: Option<DateTime<Utc>>,
+    from: Option<DateTime<Utc>>,
+
+    /// End of the query window, inclusive, and the instant a metric query is
+    /// evaluated at, RFC3339
+    ///
+    /// Unset reads to the end of the data. For a metric query that resolves to
+    /// the newest line rather than to wall-clock now, which is where this parts
+    /// ways with `logcli instant-query --now`: a file can be arbitrarily old,
+    /// and "now" would then select nothing.
+    #[arg(long, visible_alias = "now", value_name = "RFC3339")]
+    to: Option<DateTime<Utc>>,
+
+    /// Maximum number of lines to return
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+
+    /// Return the oldest lines first instead of the newest
+    #[arg(long)]
+    forward: bool,
 
     /// How to render the result
     #[arg(short, long, value_enum, default_value_t = Output::Table)]
     output: Output,
+}
+
+#[derive(clap::Args, Debug)]
+struct ServeArgs {
+    /// Log file or glob to read; use /dev/stdin for a pipe
+    #[arg(value_name = "FILENAME", value_parser = parse_source)]
+    source: String,
+
+    /// Address to listen on; 3100 is Loki's, so a Grafana datasource needs no
+    /// special casing
+    #[arg(long, default_value = "0.0.0.0:3100")]
+    listen: String,
 }
 
 /// The formats `--output` accepts. A separate enum from `output::Format` so the
@@ -81,7 +128,7 @@ fn parse_source(s: &str) -> Result<String, String> {
 async fn run(
     ctx: &SessionContext,
     logical_plan: LogicalPlan,
-    cli: &Cli,
+    args: &QueryArgs,
     kind: ResultKind,
 ) -> Result<()> {
     let frame = ctx.execute_logical_plan(logical_plan).await?;
@@ -106,8 +153,9 @@ async fn run(
             }
         }
         ResultKind::Logs => {
-            let frame = frame.sort_by(vec![col("timestamp")])?;
-            match cli.output {
+            // The plan already ordered and cut these, so there is nothing to do
+            // here but choose the columns.
+            match args.output {
                 // A table of log lines is read by a person, and a column of
                 // identical paths beside every line is just noise.
                 Output::Table => frame.select_columns(&["line"])?,
@@ -122,13 +170,13 @@ async fn run(
 
     write_result(
         &mut std::io::stdout().lock(),
-        cli.output.into(),
+        args.output.into(),
         kind,
         &results,
     )
 }
 
-/// The newest timestamp in `source`, for a metric query given no `--now`.
+/// The newest timestamp in `source`, for a metric query given no `--to`.
 ///
 /// An empty source has no newest line, so wall-clock now stands in; the query
 /// then selects nothing, which is the honest answer.
@@ -154,48 +202,61 @@ async fn newest_timestamp(ctx: &SessionContext, catalog: &Catalog) -> Result<Dat
 async fn main() {
     let cli = Cli::parse();
 
-    // A bad query or an unsupported label is a usage error: clap's format, exit 2.
-    let query = match Parser::parse(&cli.query) {
-        Ok(expr) => expr,
-        Err(e) => Cli::command().error(ErrorKind::ValueValidation, e).exit(),
-    };
-    // Opening the catalog may list an object store or read file metadata, which
-    // is why it is the one step before planning that can fail at runtime.
-    let ctx = SessionContext::new();
-    let catalog = match Catalog::open(&cli.source, &ctx.state()).await {
-        Ok(catalog) => catalog,
-        Err(e) => {
-            eprintln!("ducktails: {e}");
-            std::process::exit(1);
-        }
+    let result = match &cli.command {
+        Command::Query(args) => run_query(args).await,
+        Command::Serve(args) => serve(args).await,
     };
 
-    // Resolving the default instant reads the data, so it is only worth doing for
-    // a query that has an instant at all.
-    let kind = match query {
-        Expr::Log(_) => ResultKind::Logs,
-        Expr::Metric(_) => ResultKind::Samples,
-    };
-    let metric = kind == ResultKind::Samples;
-    let now = match cli.now {
-        Some(now) => now,
-        None if metric => match newest_timestamp(&ctx, &catalog).await {
-            Ok(now) => now,
-            Err(e) => {
-                eprintln!("ducktails: {e}");
-                std::process::exit(1);
-            }
-        },
-        None => Utc::now(),
-    };
-
-    let logical_plan = match plan(&catalog, &query, now) {
-        Ok(p) => p,
-        Err(e) => Cli::command().error(ErrorKind::ValueValidation, e).exit(),
-    };
-
-    if let Err(e) = run(&ctx, logical_plan, &cli, kind).await {
+    if let Err(e) = result {
         eprintln!("ducktails: {e}");
         std::process::exit(1);
     }
+}
+
+async fn run_query(args: &QueryArgs) -> Result<()> {
+    // A bad query or an unsupported label is a usage error: clap's format, exit 2.
+    let expr = match Parser::parse(&args.query) {
+        Ok(expr) => expr,
+        Err(e) => Cli::command().error(ErrorKind::ValueValidation, e).exit(),
+    };
+
+    // Opening the catalog may list an object store or read file metadata, which
+    // is why it is the one step before planning that can fail at runtime.
+    let ctx = SessionContext::new();
+    let catalog = Catalog::open(&args.source, &ctx.state()).await?;
+
+    let kind = match expr {
+        Expr::Log(_) => ResultKind::Logs,
+        Expr::Metric(_) => ResultKind::Samples,
+    };
+
+    // Only a metric query needs a concrete instant, and resolving the default
+    // reads the data, so it is not worth doing for a log query.
+    let end = match (args.to, kind) {
+        (Some(to), _) => Some(to),
+        (None, ResultKind::Samples) => Some(newest_timestamp(&ctx, &catalog).await?),
+        (None, ResultKind::Logs) => None,
+    };
+
+    let query = Query::new(expr)
+        .with_window(args.from, end)
+        .with_limit(Some(args.limit))
+        .with_direction(match args.forward {
+            true => Direction::Forward,
+            false => Direction::Backward,
+        });
+
+    let logical_plan = match plan(&catalog, &query) {
+        Ok(logical_plan) => logical_plan,
+        Err(e) => Cli::command().error(ErrorKind::ValueValidation, e).exit(),
+    };
+
+    run(&ctx, logical_plan, args, kind).await
+}
+
+async fn serve(args: &ServeArgs) -> Result<()> {
+    Err(datafusion::error::DataFusionError::NotImplemented(format!(
+        "serving {} on {}: the HTTP API is not built yet",
+        args.source, args.listen
+    )))
 }
