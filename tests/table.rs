@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{ctx_with, logfmt_log_file, two_log_files};
+use common::{ctx_with, logfmt_log_file, timestamped_log_file, two_log_files};
 use datafusion::arrow::array::AsArray;
 use datafusion::{assert_batches_eq, error::Result};
 
@@ -71,6 +71,34 @@ async fn lines_view_a_single_copy_of_the_file() -> Result<()> {
         buffers[0].len() as u64,
         size,
         "the block should be the file itself, verbatim"
+    );
+    Ok(())
+}
+
+/// A line's timestamp comes from the line, not from its position in the file.
+#[tokio::test]
+async fn timestamps_are_read_from_the_line() -> Result<()> {
+    let (_dir, pattern) = timestamped_log_file();
+    let ctx = ctx_with(pattern)?;
+
+    let batches = ctx
+        .sql("SELECT line FROM logs ORDER BY timestamp")
+        .await?
+        .collect()
+        .await?;
+
+    assert_batches_eq!(
+        &[
+            "+-------------------------------------------------+",
+            "| line                                            |",
+            "+-------------------------------------------------+",
+            "| 2026-11-27T10:00:00Z level=error msg=first      |",
+            "| 2026-11-27T11:00:01+01:00 level=warn msg=second |",
+            "| 2026-11-27T10:00:02Z level=info msg=third       |",
+            "| no timestamp here                               |",
+            "+-------------------------------------------------+",
+        ],
+        &batches
     );
     Ok(())
 }

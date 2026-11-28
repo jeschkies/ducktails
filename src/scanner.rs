@@ -25,6 +25,8 @@ pub enum Token {
     Pipe,
     OpenParenthesis,
     CloseParenthesis,
+    OpenBracket,
+    CloseBracket,
 
     Identifier(String),
     String(String),
@@ -61,6 +63,8 @@ impl fmt::Display for Token {
             Token::Pipe => f.write_str("|"),
             Token::OpenParenthesis => f.write_str("("),
             Token::CloseParenthesis => f.write_str(")"),
+            Token::OpenBracket => f.write_str("["),
+            Token::CloseBracket => f.write_str("]"),
 
             Token::Identifier(name) => f.write_str(name),
             // `{:?}` on a str re-adds the quotes and escapes, which is close
@@ -101,6 +105,8 @@ impl<'a> Scanner<'a> {
             '.' => Ok(Token::Dot),
             '(' => Ok(Token::OpenParenthesis),
             ')' => Ok(Token::CloseParenthesis),
+            '[' => Ok(Token::OpenBracket),
+            ']' => Ok(Token::CloseBracket),
 
             '=' if self.eat('~') => Ok(Token::Re), // =~ before =
             '=' => Ok(Token::Eq),
@@ -292,6 +298,8 @@ mod tests {
             ("|~", Token::PipeMatch),
             ("|>", Token::PipePattern),
             ("|", Token::Pipe),
+            ("[", Token::OpenBracket),
+            ("]", Token::CloseBracket),
             ("\"foo\"", Token::String("foo".into())),
         ];
         for (input, want) in cases {

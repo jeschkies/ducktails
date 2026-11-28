@@ -96,3 +96,51 @@ pub fn typed_logfmt_log_file() -> (TempDir, String) {
     let pattern = dir.path().join("*.log").to_string_lossy().into_owned();
     (dir, pattern)
 }
+
+/// Lines carrying RFC3339 timestamps, deliberately out of order in the file so
+/// that sorting by `timestamp` proves the timestamp was read from the line
+/// rather than assigned by position.
+pub fn timestamped_log_file() -> (TempDir, String) {
+    let dir = tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("app.log"),
+        concat!(
+            "2026-11-27T10:00:02Z level=info msg=third\n",
+            "2026-11-27T10:00:00Z level=error msg=first\n",
+            // An offset rather than Z, to pin that it is honoured: 11:00:01+01:00
+            // is 10:00:01Z, so this sorts second and not last.
+            "2026-11-27T11:00:01+01:00 level=warn msg=second\n",
+            // No timestamp at all: stamped with ingest time, so it sorts last.
+            "no timestamp here\n",
+        ),
+    )
+    .expect("write app.log");
+    let pattern = dir.path().join("*.log").to_string_lossy().into_owned();
+    (dir, pattern)
+}
+
+/// Two files of timestamped logfmt lines, for metric queries.
+///
+/// Evaluated at `2026-11-27T10:04:00Z`, the lines fall either side of the
+/// interesting boundaries: `a.log` has one line exactly five minutes old, one
+/// exactly four, one at the instant itself, and one an hour before.
+pub fn metric_log_files() -> (TempDir, String) {
+    let dir = tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("a.log"),
+        concat!(
+            "2026-11-27T10:00:00Z level=info msg=a\n",
+            "2026-11-27T10:02:00Z level=error msg=b\n",
+            "2026-11-27T10:04:00Z level=error msg=c\n",
+            "2026-11-27T09:00:00Z level=info msg=old\n",
+        ),
+    )
+    .expect("write a.log");
+    std::fs::write(
+        dir.path().join("b.log"),
+        "2026-11-27T10:03:00Z level=error msg=d\n",
+    )
+    .expect("write b.log");
+    let pattern = dir.path().join("*.log").to_string_lossy().into_owned();
+    (dir, pattern)
+}

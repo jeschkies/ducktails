@@ -97,12 +97,55 @@ pub struct LogQuery {
     pub pipeline: Vec<Stage>,
 }
 
+/// A log range aggregation: a function over the lines in a time window.
+///
+/// Only the four that count lines or bytes; `absent_over_time` needs "no rows
+/// yields 1", which an aggregate cannot produce without a grid of instants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeOp {
+    CountOverTime,
+    Rate,
+    BytesOverTime,
+    BytesRate,
+}
+
+impl RangeOp {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "count_over_time" => RangeOp::CountOverTime,
+            "rate" => RangeOp::Rate,
+            "bytes_over_time" => RangeOp::BytesOverTime,
+            "bytes_rate" => RangeOp::BytesRate,
+            _ => return None,
+        })
+    }
+}
+
+/// `count_over_time({app="x"} |= "error" [5m])`.
+///
+/// The range selector binds to the log query inside the parentheses, so the
+/// pipeline is parsed first and `[5m]` closes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangeAggregation {
+    pub op: RangeOp,
+    pub range: Duration,
+    pub query: LogQuery,
+}
+
 /// The root of a LogQL query.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    /// A log query: a selector, later plus a pipeline.
+    /// A log query: a selector plus a pipeline.
     Log(LogQuery),
-    // Metric(SampleExpr) — milestone 2, see DESIGN.md §4.
+    /// A metric query. Only range aggregations so far; `sum`, `avg` and the
+    /// other vector operators wrap one of these.
+    Metric(RangeAggregation),
+}
+
+/// The `expected` side of a parse error names a *kind* of token, and `Duration`
+/// has no spelling for "any duration", so an error reports `[0s]`.
+fn d_zero() -> Duration {
+    Duration::ZERO
 }
 
 pub struct Parser<'a> {
@@ -114,9 +157,44 @@ impl<'a> Parser<'a> {
         let mut p = Parser {
             scanner: Scanner::new(query),
         };
-        let log_query = p.log_query()?;
+        let expr = p.expr()?;
         p.expect(Token::Eol)?;
-        Ok(Expr::Log(log_query))
+        Ok(expr)
+    }
+
+    /// A query is either a log query, which starts with a selector, or a metric
+    /// query, which starts with the name of a function.
+    fn expr(&mut self) -> Result<Expr, ParseError> {
+        match self.scanner.peek_token()? {
+            Token::Identifier(name) => {
+                self.scanner.next_token()?; // the name is ours now
+                Ok(Expr::Metric(self.range_aggregation(name)?))
+            }
+            _ => Ok(Expr::Log(self.log_query()?)),
+        }
+    }
+
+    /// Parse `count_over_time({app="x"} |= "error" [5m])`, the name already read.
+    fn range_aggregation(&mut self, name: String) -> Result<RangeAggregation, ParseError> {
+        let op = RangeOp::from_name(&name).ok_or(ParseError::UnknownFunction(name))?;
+
+        self.expect(Token::OpenParenthesis)?;
+        let query = self.log_query()?;
+
+        self.expect(Token::OpenBracket)?;
+        let range = match self.scanner.next_token()? {
+            Token::Duration(d) => d,
+            other => {
+                return Err(ParseError::UnexpectedToken(
+                    other,
+                    Token::Duration(d_zero()),
+                ));
+            }
+        };
+        self.expect(Token::CloseBracket)?;
+        self.expect(Token::CloseParenthesis)?;
+
+        Ok(RangeAggregation { op, range, query })
     }
 
     fn expect(&mut self, expected: Token) -> Result<(), ParseError> {
@@ -210,9 +288,14 @@ impl<'a> Parser<'a> {
                 self.scanner.next_token()?; // eat previous pipe token
                 match self.scanner.next_token()? {
                     Token::Identifier(id) if id == "logfmt" => Ok(Some(Stage::Logfmt)),
-                    Token::Identifier(label) => {
-                        Ok(self.label_filter(label)?.map(Stage::LabelFilter))
-                    }
+                    Token::Identifier(label) => match self.label_filter(label.clone())? {
+                        Some(filter) => Ok(Some(Stage::LabelFilter(filter))),
+                        // A pipe commits to a stage, so an identifier with no
+                        // operator after it is a parser we do not have — `| json`,
+                        // say — and not the end of the pipeline. Returning `None`
+                        // here would drop the stage and answer the wrong query.
+                        None => Err(ParseError::UnknownParser(label)),
+                    },
                     other => Err(ParseError::UnexpectedToken(
                         other,
                         Token::Identifier("identifier".into()),
@@ -584,7 +667,7 @@ mod tests {
         // anonymous type, so a table of closures would not typecheck as an array.
         type Check = fn(&ParseError) -> bool;
 
-        let cases: [(&str, Check, &str); 10] = [
+        let cases: [(&str, Check, &str); 13] = [
             (
                 r#"{foo="bar",}"#,
                 |e| matches!(e, ParseError::UnexpectedToken(Token::CloseBrace, _)),
@@ -645,9 +728,31 @@ mod tests {
                 "unquoted matcher value",
             ),
             (
+                // A query starts with either a selector or a function, so a bare
+                // identifier here is read as the latter — which also gives the
+                // right message for a misspelled `count_over_time`.
                 r#"foo="bar""#,
-                |e| matches!(e, ParseError::UnexpectedToken(Token::Identifier(n), Token::OpenBrace) if n == "foo"),
-                "no opening brace: a query must start with a selector",
+                |e| matches!(e, ParseError::UnknownFunction(n) if n == "foo"),
+                "a leading identifier can only be a function name",
+            ),
+            (
+                // The bug this replaced: the pipe was consumed, the stage
+                // dropped, and `{} | json` answered as if it were bare `{}`.
+                "{} | json",
+                |e| matches!(e, ParseError::UnknownParser(n) if n == "json"),
+                "an unknown parser stage must not be silently dropped",
+            ),
+            (
+                r#"{} | json |= "error""#,
+                |e| matches!(e, ParseError::UnknownParser(n) if n == "json"),
+                "and not when something follows it either",
+            ),
+            (
+                // No operator, so it is not a label filter; no parser by that
+                // name either.
+                "{} | level",
+                |e| matches!(e, ParseError::UnknownParser(n) if n == "level"),
+                "a label with no operator is not a stage",
             ),
             (
                 // Scanner-level failures must surface through the parser too.

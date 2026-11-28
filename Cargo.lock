@@ -1494,6 +1494,7 @@ dependencies = [
  "datafusion-datasource",
  "divan",
  "glob",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
