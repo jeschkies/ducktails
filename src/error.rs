@@ -6,6 +6,8 @@ pub enum ParseError {
     UnexpectedChar(char),
     UnexpectedToken(Token, Token),
     UnexpectedEOL,
+    UnknownFunction(String),
+    UnknownParser(String),
     Unsupported,
 }
 
@@ -17,6 +19,8 @@ impl fmt::Display for ParseError {
                 write!(f, "Unexpected token: '{actual}', expected: {expected}")
             }
             ParseError::UnexpectedEOL => write!(f, "Unexpected end of line"),
+            ParseError::UnknownFunction(name) => write!(f, "Unknown function: {name}"),
+            ParseError::UnknownParser(name) => write!(f, "Unknown pipeline stage: {name}"),
             ParseError::Unsupported => write!(f, "Unsupported"),
         }
     }

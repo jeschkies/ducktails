@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use glob::glob;
 use std::{fs::read_to_string, path::PathBuf, sync::Arc};
 
@@ -22,6 +22,19 @@ use datafusion_datasource::memory::MemorySourceConfig;
 
 /// `Utf8View`, so a key or value can *point at* the line it was parsed out of
 /// instead of being copied out of it — see `logfmt_parse`.
+/// The columns every catalog gives a fixed meaning to. Anything else it exposes
+/// is a stream label: `filename` for a file, `service`/`env` for a column-mapped
+/// table, whatever a Loki catalog advertises.
+///
+/// `value` only appears in a metric result, but it is reserved everywhere so the
+/// planner and the output layer agree on the same set.
+pub const CANONICAL: [&str; 4] = ["timestamp", "line", "labels", "value"];
+
+/// Whether a column of that name is a label rather than one of the fixed ones.
+pub fn is_label(name: &str) -> bool {
+    !CANONICAL.contains(&name)
+}
+
 pub fn label_fields() -> Fields {
     Fields::from(vec![
         Field::new("key", DataType::Utf8View, false),
@@ -61,6 +74,24 @@ pub fn log_schema() -> SchemaRef {
     Arc::new(schema)
 }
 
+/// Nanoseconds since the epoch from an RFC3339 timestamp at the *start* of
+/// `line`, if there is one.
+///
+/// Only the start, and only RFC3339. lambda-promtail declares a regex and a Go
+/// layout per log source rather than guessing at the format, which is the shape
+/// a `--timestamp-format` flag should grow into; until then, guessing exactly one
+/// well-specified format is the honest subset.
+///
+/// No timezone handling is needed: the result is an absolute instant, so an
+/// offset in the text is already accounted for.
+fn line_timestamp(line: &str) -> Option<i64> {
+    // An RFC3339 timestamp contains no spaces, so the first field is all of it.
+    let field = line.split([' ', '\t']).next()?;
+    DateTime::parse_from_rfc3339(field)
+        .ok()?
+        .timestamp_nanos_opt()
+}
+
 pub fn read_source(path: &str) -> Result<RecordBatch> {
     let schema = log_schema();
 
@@ -69,7 +100,6 @@ pub fn read_source(path: &str) -> Result<RecordBatch> {
     let mut labels_builder = ListBuilder::new(StructBuilder::from_fields(label_fields(), 0));
     let mut filename_builder = StringBuilder::new();
 
-    let ingested_at = Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let contents = read_to_string(path)
         .map_err(|e| DataFusionError::from(e).context(format!("reading {path}")))?;
 
@@ -86,11 +116,20 @@ pub fn read_source(path: &str) -> Result<RecordBatch> {
     // Locate the lines first: `Buffer::from_vec` takes ownership of the bytes, so
     // this is the last chance to look at them as a `str`. Subtracting the
     // pointers is sound because every line is a slice of this one allocation.
-    let lines: Vec<(u32, u32)> = contents
+    //
+    // The timestamp is read here for the same reason — it comes from the text,
+    // not from the view.
+    let ingested_at = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let lines: Vec<(u32, u32, i64)> = contents
         .lines()
-        .map(|line| {
+        .enumerate()
+        .map(|(i, line)| {
             let offset = line.as_ptr() as usize - contents.as_ptr() as usize;
-            (offset as u32, line.len() as u32)
+            // Ingest time when the line carries none, as lambda-promtail does.
+            // The `+ i` keeps those lines in file order, which is the only order
+            // they have.
+            let timestamp = line_timestamp(line).unwrap_or(ingested_at + i as i64);
+            (offset as u32, line.len() as u32, timestamp)
         })
         .collect();
 
@@ -99,8 +138,8 @@ pub fn read_source(path: &str) -> Result<RecordBatch> {
     // comes back from `append_block` — it is not necessarily 0.
     let block = line_builder.append_block(Buffer::from_vec(contents.into_bytes()));
 
-    for (i, (offset, len)) in lines.iter().enumerate() {
-        ts_builder.append_value(ingested_at + i as i64); // TODO: infer ts
+    for (offset, len, timestamp) in &lines {
+        ts_builder.append_value(*timestamp);
         line_builder.try_append_view(block, *offset, *len)?;
         labels_builder.append_null();
         filename_builder.append_value(path); // TODO: can save memory here

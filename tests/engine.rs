@@ -5,10 +5,13 @@
 
 mod common;
 
-use common::{logfmt_log_file, long_logfmt_log_file, two_log_files, typed_logfmt_log_file};
+use chrono::{DateTime, Utc};
+use common::{
+    logfmt_log_file, long_logfmt_log_file, metric_log_files, two_log_files, typed_logfmt_log_file,
+};
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::{assert_batches_eq, error::Result, logical_expr::col, prelude::SessionContext};
-use ducktails::{parser::Parser, plan::plan};
+use ducktails::{catalog::Catalog, parser::Parser, plan::plan};
 
 /// Runs `query` over `pattern` and returns `columns` in file order.
 async fn run(
@@ -17,7 +20,7 @@ async fn run(
     columns: &[&str],
 ) -> Result<Vec<datafusion::arrow::array::RecordBatch>> {
     let ast = Parser::parse(query).expect("test query must parse");
-    let logical_plan = plan(pattern, &ast)?;
+    let logical_plan = plan(&Catalog::files(pattern), &ast, Utc::now())?;
 
     SessionContext::new()
         .execute_logical_plan(logical_plan)
@@ -241,7 +244,7 @@ async fn the_pipeline_reads_the_line_view_without_casting_it() -> Result<()> {
 
     let ast = Parser::parse(r#"{} | logfmt |= "code=500""#).expect("test query must parse");
     let optimized = SessionContext::new()
-        .execute_logical_plan(plan(&pattern, &ast)?)
+        .execute_logical_plan(plan(&Catalog::files(&pattern), &ast, Utc::now())?)
         .await?
         .logical_plan()
         .display_indent()
@@ -301,9 +304,26 @@ async fn a_label_filter_cannot_order_a_string() {
     let (_dir, pattern) = typed_logfmt_log_file();
 
     let ast = Parser::parse(r#"{} | logfmt | level>="error""#).expect("should parse");
-    let err = plan(&pattern, &ast).expect_err("ordering a string is not meaningful");
+    let err = plan(&Catalog::files(&pattern), &ast, Utc::now())
+        .expect_err("ordering a string is not meaningful");
 
     assert!(err.to_string().contains("level"), "got {err}");
+}
+
+/// A label filter resolves a column first, so `filename` — which the catalog
+/// materialises — works in the pipeline and not only in the selector.
+#[tokio::test]
+async fn a_label_filter_reaches_a_catalog_label() -> Result<()> {
+    let (_dir, pattern) = two_log_files();
+
+    // `a.log` holds one/two/three; the filter keeps exactly those.
+    let got = to_strings(&lines(&pattern, r#"{} | filename=~".*/a\.log""#).await?);
+    assert_eq!(got, vec!["one", "two", "three"]);
+
+    // And the negation keeps the other file's lines.
+    let got = to_strings(&lines(&pattern, r#"{} | filename!~".*/a\.log""#).await?);
+    assert_eq!(got, vec!["four", "five"]);
+    Ok(())
 }
 
 /// A label we cannot resolve yet must be reported, not silently return nothing.
@@ -312,9 +332,13 @@ async fn unavailable_label_is_an_error() {
     let (_dir, pattern) = two_log_files();
 
     let ast = Parser::parse(r#"{job="app"}"#).expect("should parse");
-    let err = plan(&pattern, &ast).expect_err("job is not available yet");
+    let err =
+        plan(&Catalog::files(&pattern), &ast, Utc::now()).expect_err("job is not available yet");
 
-    assert!(err.to_string().contains("job"), "got {err}");
+    let message = err.to_string();
+    assert!(message.contains("job"), "got {message}");
+    // The message names the labels this source does have.
+    assert!(message.contains("filename"), "got {message}");
 }
 
 /// A source that matches no files is a different failure from a query that
@@ -329,4 +353,126 @@ async fn a_glob_matching_no_files_is_an_error() {
         .expect_err("no files match the glob");
 
     assert!(err.to_string().contains("no files match"), "got {err}");
+}
+
+/// The instant the metric tests evaluate at. Fixed, so the windows are too.
+const NOW: &str = "2026-11-27T10:04:00Z";
+
+/// Runs a metric query at `NOW` and returns its `value` column, one row per
+/// series, ordered by series so the expectations are stable.
+async fn samples(pattern: &str, query: &str) -> Result<Vec<datafusion::arrow::array::RecordBatch>> {
+    let ast = Parser::parse(query).expect("test query must parse");
+    let now: DateTime<Utc> = NOW.parse().expect("instant must parse");
+
+    SessionContext::new()
+        .execute_logical_plan(plan(&Catalog::files(pattern), &ast, now)?)
+        .await?
+        .sort_by(vec![col("filename")])?
+        .select_columns(&["value"])?
+        .collect()
+        .await
+}
+
+/// `count_over_time` counts the lines whose own timestamp falls in the window,
+/// which is `(now - range, now]` — half-open at the start, as Loki's is.
+#[tokio::test]
+async fn count_over_time_counts_the_lines_in_the_window() -> Result<()> {
+    let (_dir, pattern) = metric_log_files();
+
+    // `a.log` has lines at 09:00, 10:00, 10:02 and 10:04; `b.log` one at 10:03.
+    let cases = [
+        // Five minutes back reaches 09:59, so everything but the 09:00 line.
+        ("count_over_time({}[5m])", vec![3, 1]),
+        // Four minutes back lands *exactly* on the 10:00 line, which the open
+        // bound excludes.
+        ("count_over_time({}[4m])", vec![2, 1]),
+        // Wide enough for every line in both files.
+        ("count_over_time({}[2h])", vec![4, 1]),
+        // Narrow enough to catch only the line at the instant itself.
+        ("count_over_time({}[1m])", vec![1]),
+    ];
+
+    for (query, want) in cases {
+        let batches = samples(&pattern, query).await?;
+        let got: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                let column = b
+                    .column(0)
+                    .as_primitive::<datafusion::arrow::datatypes::Int64Type>();
+                (0..b.num_rows())
+                    .map(|i| column.value(i))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(got, want, "query: {query}");
+    }
+    Ok(())
+}
+
+/// The pipeline runs before the aggregation, so filters narrow what is counted.
+#[tokio::test]
+async fn a_range_aggregation_counts_what_the_pipeline_kept() -> Result<()> {
+    let (_dir, pattern) = metric_log_files();
+
+    for query in [
+        r#"count_over_time({} |= "error" [5m])"#,
+        r#"count_over_time({} | logfmt | level="error" [5m])"#,
+    ] {
+        assert_batches_eq!(
+            &[
+                "+-------+",
+                "| value |",
+                "+-------+",
+                "| 2     |",
+                "| 1     |",
+                "+-------+",
+            ],
+            &samples(&pattern, query).await?
+        );
+    }
+    Ok(())
+}
+
+/// `bytes_over_time` measures volume rather than lines, and the two rate
+/// functions are those same sums over the window in seconds.
+#[tokio::test]
+async fn the_byte_and_rate_variants() -> Result<()> {
+    let (_dir, pattern) = metric_log_files();
+
+    // The three lines of `a.log` in the window are 37 + 38 + 38 bytes; `b.log`'s
+    // single line is 38.
+    assert_batches_eq!(
+        &[
+            "+-------+",
+            "| value |",
+            "+-------+",
+            "| 113   |",
+            "| 38    |",
+            "+-------+",
+        ],
+        &samples(&pattern, "bytes_over_time({}[5m])").await?
+    );
+
+    // 3 lines and 1 line over 300 seconds.
+    assert_batches_eq!(
+        &[
+            "+-----------------------+",
+            "| value                 |",
+            "+-----------------------+",
+            "| 0.01                  |",
+            "| 0.0033333333333333335 |",
+            "+-----------------------+",
+        ],
+        &samples(&pattern, "rate({}[5m])").await?
+    );
+    Ok(())
+}
+
+/// An unknown function is a usage error, and says which name it did not know.
+#[test]
+fn an_unknown_function_is_reported() {
+    let err = Parser::parse("coun_over_time({}[5m])").expect_err("should not parse");
+
+    assert_eq!(err.to_string(), "Unknown function: coun_over_time");
 }
