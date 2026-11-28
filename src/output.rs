@@ -38,7 +38,11 @@ pub fn write_result(
 ) -> Result<()> {
     match format {
         Format::Table => writeln!(out, "{}", pretty_format_batches(batches)?),
-        Format::Json => writeln!(out, "{}", json_result(kind, batches)?),
+        Format::Json => {
+            let body = serde_json::to_string_pretty(&json_result(kind, batches)?)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            writeln!(out, "{body}")
+        }
     }
     .map_err(|e| DataFusionError::IoError(e).context("writing the result"))
 }
@@ -77,7 +81,11 @@ fn labels_of(batch: &RecordBatch, columns: &[usize], row: usize) -> Result<Value
     Ok(Value::Object(labels))
 }
 
-fn json_result(kind: ResultKind, batches: &[RecordBatch]) -> Result<String> {
+/// The Prometheus/Loki response body for a result set.
+///
+/// A `Value` rather than a string: the HTTP API returns it as JSON directly, and
+/// only the terminal wants it pretty-printed.
+pub fn json_result(kind: ResultKind, batches: &[RecordBatch]) -> Result<Value> {
     let result = match kind {
         ResultKind::Samples => vector_result(batches)?,
         ResultKind::Logs => streams_result(batches)?,
@@ -87,11 +95,10 @@ fn json_result(kind: ResultKind, batches: &[RecordBatch]) -> Result<String> {
         ResultKind::Logs => "streams",
     };
 
-    serde_json::to_string_pretty(&json!({
+    Ok(json!({
         "status": "success",
         "data": { "resultType": result_type, "result": result },
     }))
-    .map_err(|e| DataFusionError::External(Box::new(e)))
 }
 
 /// A metric query is already one row per series, so each row is one sample.

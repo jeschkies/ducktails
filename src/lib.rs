@@ -10,6 +10,7 @@ pub mod parser;
 pub mod plan;
 pub mod query;
 pub mod scanner;
+pub mod server;
 pub mod table;
 pub mod udf;
 pub mod units;

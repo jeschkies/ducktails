@@ -164,6 +164,49 @@ pub fn plan_newest(catalog: &Catalog) -> Result<LogicalPlan> {
         .build()
 }
 
+/// The label names a catalog carries, which is what `/labels` answers.
+///
+/// No query runs: the names are in the schema, so a catalog that knows its
+/// labels — a file, a mapped Parquet table — answers without touching data.
+pub fn label_names(catalog: &Catalog) -> Result<Vec<String>> {
+    Ok(catalog
+        .scan()?
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .filter(|name| is_label(name))
+        .collect())
+}
+
+/// Plans the distinct values of one label, which is what `/label/{name}/values`
+/// answers.
+///
+/// Grouping rather than `DISTINCT`, because that is what `DISTINCT` lowers to
+/// anyway, and the window keeps the answer to what the caller asked about.
+pub fn plan_label_values(
+    catalog: &Catalog,
+    name: &str,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+) -> Result<LogicalPlan> {
+    if !label_names(catalog)?.iter().any(|label| label == name) {
+        return Err(DataFusionError::Plan(format!(
+            "label {name:?}: this source has no such label"
+        )));
+    }
+
+    let mut builder = catalog.scan()?;
+    if let Some(predicate) = window_predicate(start, end)? {
+        builder = builder.filter(predicate)?;
+    }
+
+    builder
+        .aggregate(vec![col(name)], Vec::<DfExpr>::new())?
+        .sort(vec![col(name).sort(true, false)])?
+        .build()
+}
+
 /// A timestamp literal of the same type as the `timestamp` column.
 fn instant(nanos: i64) -> DfExpr {
     lit(ScalarValue::TimestampNanosecond(Some(nanos), None))

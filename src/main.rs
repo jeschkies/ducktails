@@ -11,6 +11,7 @@ use ducktails::output::{Format, ResultKind, write_result};
 use ducktails::parser::{Expr, Parser};
 use ducktails::plan::{plan, plan_newest};
 use ducktails::query::{Direction, Query};
+use ducktails::server;
 use ducktails::table::is_label;
 
 /// Like DuckDB but for logs.
@@ -255,8 +256,8 @@ async fn run_query(args: &QueryArgs) -> Result<()> {
 }
 
 async fn serve(args: &ServeArgs) -> Result<()> {
-    Err(datafusion::error::DataFusionError::NotImplemented(format!(
-        "serving {} on {}: the HTTP API is not built yet",
-        args.source, args.listen
-    )))
+    let ctx = SessionContext::new();
+    let catalog = Catalog::open(&args.source, &ctx.state()).await?;
+
+    server::serve(&args.listen, server::Api::new(ctx, catalog)).await
 }

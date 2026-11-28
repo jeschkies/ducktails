@@ -104,13 +104,13 @@ Operators and literals:
 
 ### Server mode
 
-`ducktails serve` exists as a subcommand and does nothing yet. The aim is enough
-of Loki's HTTP API to point Grafana at, then Loki's gRPC querier protocol so it
-can stand in for a querier.
+`ducktails serve` answers enough of Loki's HTTP API to browse logs in Grafana.
+Metric panels need the step grid below; after that, Loki's gRPC querier protocol
+would let it stand in for a querier.
 
-- [ ] `/ready`, `/status/buildinfo`, `/labels`, `/label/{name}/values`
-- [ ] `/query` and `/query_range` for log queries — `streams`, which the output
-      layer already emits
+- [x] `/ready`, `/status/buildinfo`, `/labels`, `/label/{name}/values`
+- [x] `/query` and `/query_range` for log queries — `streams`, which the output
+      layer already emits. GET and form POST, since Grafana sends both.
 - [ ] `/query_range` for metric queries, which needs `matrix` and a grid of
       instants, and is what motivates `sum by`/`without`
 - [ ] The gRPC querier protocol: `SchedulerForQuerier.QuerierLoop`, typed
